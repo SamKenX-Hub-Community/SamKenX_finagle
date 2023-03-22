@@ -5,26 +5,36 @@ import com.twitter.finagle.netty4.http._
 import com.twitter.finagle.netty4.http.handler.UriValidatorHandler
 import com.twitter.finagle.param.Stats
 import com.twitter.finagle.stats.InMemoryStatsReceiver
+import io.netty.buffer.ByteBuf
+import io.netty.buffer.ByteBufUtil
 import io.netty.buffer.Unpooled._
-import io.netty.buffer.{ByteBuf, ByteBufUtil}
 import io.netty.channel._
 import io.netty.channel.embedded.EmbeddedChannel
 import io.netty.handler.codec.http2.Http2CodecUtil._
 import io.netty.util.CharsetUtil._
-import org.mockito.Matchers._
+import org.mockito.ArgumentCaptor
+import org.mockito.ArgumentMatchers
+import org.mockito.ArgumentMatchers._
 import org.mockito.Mockito._
-import org.mockito.{ArgumentCaptor, Matchers}
 import org.scalatest.BeforeAndAfter
-import org.scalatestplus.mockito.MockitoSugar
 import org.scalatest.funsuite.AnyFunSuite
+import org.scalatestplus.mockito.MockitoSugar
 
 class PriorKnowledgeHandlerTest extends AnyFunSuite with BeforeAndAfter with MockitoSugar {
+  // We need to extend ChannelInboundHandlerAdapter because without doing so, since all
+  // methods are marked @Skip, the handler will be skipped altogether
+  class TestHandler extends ChannelInboundHandlerAdapter {
+    override def channelRead(
+      ctx: ChannelHandlerContext,
+      msg: Any
+    ): Unit = ctx.fireChannelRead(msg)
+  }
 
   val PriorKnowledgeHandlerName = "priorKnowledgeHandler"
 
   var pipeline: ChannelPipeline = null
   var channel: EmbeddedChannel = null
-  var dummyHandler: ChannelInboundHandlerAdapter = null
+  var mockHandler: ChannelInboundHandlerAdapter = null
 
   val stats = new InMemoryStatsReceiver
   var params = Params.empty + Stats(stats)
@@ -41,15 +51,15 @@ class PriorKnowledgeHandlerTest extends AnyFunSuite with BeforeAndAfter with Moc
     val priorKnowledgeHandler = new PriorKnowledgeHandler(initializer, params)
     pipeline.addLast(PriorKnowledgeHandlerName, priorKnowledgeHandler)
 
-    dummyHandler = mock[ChannelInboundHandlerAdapter]
-    pipeline.addLast(dummyHandler)
+    mockHandler = mock[TestHandler]
+    pipeline.addLast(mockHandler)
 
-    // we place this after the dummy handler so even when replaced with an http/2 codec
-    // the dummy handler still sees messages first
-    val dummyHttp11Codec = new ChannelHandlerAdapter() {}
-    pipeline.addLast(HttpCodecName, dummyHttp11Codec)
-    val dummyUpgradeHandler = new ChannelHandlerAdapter() {}
-    pipeline.addLast("upgradeHandler", dummyUpgradeHandler)
+    // we place this after the mockhandler so even when replaced with an http/2 codec
+    // the mockhandler still sees messages first
+    val http11Codec = new ChannelHandlerAdapter() {}
+    pipeline.addLast(HttpCodecName, http11Codec)
+    val upgradeHandler = new ChannelHandlerAdapter() {}
+    pipeline.addLast("upgradeHandler", upgradeHandler)
     pipeline.addLast(UriValidatorHandler.HandlerName, UriValidatorHandler)
   }
 
@@ -63,7 +73,7 @@ class PriorKnowledgeHandlerTest extends AnyFunSuite with BeforeAndAfter with Moc
 
     channel.writeInbound(nonPrefaceBytes)
 
-    verify(dummyHandler).channelRead(anyObject(), Matchers.eq(nonPrefaceBytes))
+    verify(mockHandler).channelRead(anyObject(), ArgumentMatchers.eq(nonPrefaceBytes))
     assert(pipeline.names().contains(HttpCodecName))
     assert(pipeline.names().contains(UriValidatorHandler.HandlerName))
     assert(!pipeline.names().contains(PriorKnowledgeHandlerName))
@@ -82,12 +92,12 @@ class PriorKnowledgeHandlerTest extends AnyFunSuite with BeforeAndAfter with Moc
 
     channel.writeInbound(partialPreface.duplicate())
 
-    verify(dummyHandler, never()).channelRead(anyObject(), anyObject())
+    verify(mockHandler, never()).channelRead(anyObject(), anyObject())
 
     channel.writeInbound(nonMatching)
 
     val msgCapture: ArgumentCaptor[ByteBuf] = ArgumentCaptor.forClass(classOf[ByteBuf])
-    verify(dummyHandler, times(2)).channelRead(anyObject(), msgCapture.capture())
+    verify(mockHandler, times(2)).channelRead(anyObject(), msgCapture.capture())
 
     assert(pipeline.names().contains(HttpCodecName))
     assert(pipeline.names().contains(UriValidatorHandler.HandlerName))
@@ -119,7 +129,7 @@ class PriorKnowledgeHandlerTest extends AnyFunSuite with BeforeAndAfter with Moc
     channel.writeInbound(prefacePlusExtra)
 
     val msgCapture: ArgumentCaptor[ByteBuf] = ArgumentCaptor.forClass(classOf[ByteBuf])
-    verify(dummyHandler, times(2)).channelRead(anyObject(), msgCapture.capture())
+    verify(mockHandler, times(2)).channelRead(anyObject(), msgCapture.capture())
     assert(pipeline.names().contains(Http2CodecName))
     assert(!pipeline.names().contains(HttpCodecName))
     assert(!pipeline.names().contains(PriorKnowledgeHandlerName))

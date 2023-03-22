@@ -1,6 +1,7 @@
 java_library(
     sources = ["**/*.java"],
     compiler_option_sets = ["fatal_warnings"],
+    platform = "java8",
     provides = artifact(
         org = "com.twitter",
         name = "finagle-memcached-java",
@@ -19,8 +20,8 @@ java_library(
     ],
 )
 
-# TODO: Remove this and references to it,
-# when a fix for https://github.com/pantsbuild/pants/issues/7200 has landed.
+# TODO: Change this to filegroup per https://github.com/pantsbuild/pants/issues/7200
+# when we switch entirely to bazel
 files(
     name = "pants-workaround",
     sources = ["**/*.java"],

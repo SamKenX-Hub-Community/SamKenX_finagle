@@ -1,104 +1,97 @@
 package com.twitter.finagle.service
 
-import com.twitter.finagle.Service
-import com.twitter.finagle.service.MetricBuilderRegistry.ExpressionNames.acRejectName
-import com.twitter.finagle.service.MetricBuilderRegistry.ExpressionNames.deadlineRejectName
-import com.twitter.finagle.service.MetricBuilderRegistry._
 import com.twitter.finagle.stats.InMemoryStatsReceiver
-import com.twitter.finagle.stats.Metadata
-import com.twitter.finagle.stats.MetricBuilder
-import com.twitter.finagle.stats.MetricBuilder.CounterType
-import com.twitter.finagle.stats.MetricBuilder.HistogramType
-import com.twitter.finagle.stats.exp.ExpressionNames.failuresName
-import com.twitter.finagle.stats.exp.ExpressionNames.latencyName
-import com.twitter.finagle.stats.exp.ExpressionNames.successRateName
-import com.twitter.finagle.stats.exp.ExpressionNames.throughputName
-import com.twitter.util.Future
-import com.twitter.util.testing.ExpressionTestMixin
+import com.twitter.finagle.stats.Percentage
+import com.twitter.finagle.stats.exp.Expression
+import com.twitter.finagle.stats.exp.ExpressionSchema
+import com.twitter.finagle.stats.exp.GreaterThan
+import com.twitter.finagle.stats.exp.MonotoneThresholds
+import org.scalatest.OneInstancePerTest
 import org.scalatest.funsuite.AnyFunSuite
 
-class MetricBuilderRegistryTest extends AnyFunSuite with ExpressionTestMixin {
-  val sr = new InMemoryStatsReceiver
-  val downstreamLabel = Map()
+class MetricBuilderRegistryTest extends AnyFunSuite with OneInstancePerTest {
 
-  class Ctx {
-    val svc = Service.mk { _: String => Future.value("hi") }
-    val metricBuilders = Map[MetricName, Metadata](
-      DeadlineRejectedCounter -> MetricBuilder(
-        name = Seq("deadline", "rejected"),
-        metricType = CounterType,
-        statsReceiver = sr),
-      ACRejectedCounter -> MetricBuilder(
-        name = Seq("admission_control", "rejections"),
-        metricType = CounterType,
-        statsReceiver = sr),
-      SuccessCounter -> MetricBuilder(
-        name = Seq("success"),
-        metricType = CounterType,
-        statsReceiver = sr),
-      FailureCounter -> MetricBuilder(
-        name = Seq("failures"),
-        metricType = CounterType,
-        statsReceiver = sr),
-      RequestCounter -> MetricBuilder(
-        name = Seq("requests"),
-        metricType = CounterType,
-        statsReceiver = sr),
-      LatencyP99Histogram -> MetricBuilder(
-        name = Seq("latency"),
-        metricType = HistogramType,
-        statsReceiver = sr)
-    )
-  }
+  private class OneCounterBuilder extends MetricBuilderRegistry {
+    object Counter extends MetricName
 
-  test("Expression Factory generates all expressions when metrics are injected") {
-    new Ctx {
-      val mbr = new MetricBuilderRegistry()
+    defineBuilder(Set(Counter)) { results =>
+      val expression1 = Expression(results(Counter))
 
-      metricBuilders.map {
-        case (name, metricBuilder) =>
-          mbr.setMetricBuilder(name, metricBuilder)
-      }
-
-      assert(sr.expressions.isEmpty)
-
-      mbr.successRate
-      mbr.throughput
-      mbr.latencyP99
-      mbr.deadlineRejection
-      mbr.acRejection
-      mbr.failures
-
-      assert(sr.expressions.size == 6)
-      assertExpressionIsRegistered(successRateName)
-      assertExpressionIsRegistered(throughputName)
-      assertExpressionIsRegistered(latencyName, Map("bucket" -> "p99"))
-      assertExpressionIsRegistered(deadlineRejectName)
-      assertExpressionIsRegistered(acRejectName)
-      assertExpressionIsRegistered(failuresName)
+      ExpressionSchema("counterMultiply", expression1.multiply(Expression(100)))
+        .withBounds(MonotoneThresholds(GreaterThan, 99.5, 99.97))
+        .withUnit(Percentage)
+        .withDescription("Counter expression")
     }
   }
 
-  test("no-op when any needed metrics is non-present") {
-    new Ctx {
-      val metricBuildersMissing = metricBuilders - RequestCounter
-      val mbr = new MetricBuilderRegistry()
-      metricBuildersMissing.map {
-        case (name, metricBuilder) =>
-          mbr.setMetricBuilder(name, metricBuilder)
-      }
+  private class TwoCounterBuilder extends MetricBuilderRegistry {
+    object Counter1 extends MetricName
+    object Counter2 extends MetricName
 
-      assert(sr.expressions.isEmpty)
+    defineBuilder(Set(Counter1, Counter2)) { results =>
+      val expression1 = Expression(results(Counter1))
+      val expression2 = Expression(results(Counter2))
 
-      mbr.successRate
-      mbr.throughput
-      mbr.latencyP99
-      mbr.deadlineRejection
-      mbr.acRejection
-
-      assert(sr.expressions.size == 2)
-      assertExpressionsAsExpected(
-        Set(nameToKey(successRateName), nameToKey(latencyName, Map("bucket" -> "p99"))))
+      ExpressionSchema("counterMultiply", expression1.multiply(expression2))
+        .withBounds(MonotoneThresholds(GreaterThan, 99.5, 99.97))
+        .withUnit(Percentage)
+        .withDescription("Counter expression")
     }
+  }
+
+  private val sr = new InMemoryStatsReceiver
+
+  test("supports expressions with single arguments") {
+    val testBuilder = new OneCounterBuilder
+
+    val counter = sr.counter("count1").metadata.toMetricBuilder.get
+
+    // Nothing yet.
+    assert(sr.expressions.size == 0)
+
+    // Set the expression
+    testBuilder.setMetricBuilder(testBuilder.Counter, counter, sr)
+    assert(sr.expressions.size == 1)
+  }
+
+  test("supports compound expressions") {
+    val testBuilder = new TwoCounterBuilder
+
+    val counter1 = sr.counter("count1").metadata.toMetricBuilder.get
+    val counter2 = sr.counter("count2").metadata.toMetricBuilder.get
+
+    // Nothing yet.
+    assert(sr.expressions.size == 0)
+
+    // Set the expression
+    testBuilder.setMetricBuilder(testBuilder.Counter1, counter1, sr)
+    testBuilder.setMetricBuilder(testBuilder.Counter2, counter2, sr)
+    assert(sr.expressions.size == 1)
+  }
+
+  test("expressions are not re-registered") {
+    val testBuilder = new TwoCounterBuilder
+
+    val counter1 = sr.counter("count1").metadata.toMetricBuilder.get
+    val counter2 = sr.counter("count2").metadata.toMetricBuilder.get
+
+    // Nothing yet.
+    assert(sr.expressions.size == 0)
+
+    // Expression is not complete with only one counter
+    testBuilder.setMetricBuilder(testBuilder.Counter1, counter1, sr)
+    assert(sr.expressions.size == 0)
+
+    // Now we complete the expression
+    testBuilder.setMetricBuilder(testBuilder.Counter2, counter2, sr)
+    assert(sr.expressions.size == 1)
+
+    sr.expressions.clear()
+
+    // We don't attempt to re-register the expression since we've already done it.
+    testBuilder.setMetricBuilder(testBuilder.Counter1, counter1, sr)
+    assert(sr.expressions.size == 0)
+    testBuilder.setMetricBuilder(testBuilder.Counter2, counter2, sr)
+    assert(sr.expressions.size == 0)
   }
 }

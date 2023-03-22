@@ -4,7 +4,11 @@ import com.twitter.finagle._
 import com.twitter.finagle.param.Stats
 import com.twitter.finagle.stats.StatsReceiver
 import com.twitter.logging.Logger
-import com.twitter.util.{Future, Return, Stopwatch, Throw, Time}
+import com.twitter.util.Future
+import com.twitter.util.Return
+import com.twitter.util.Stopwatch
+import com.twitter.util.Throw
+import com.twitter.util.Time
 
 object RollbackFactory {
   private val RollbackQuery = QueryRequest("ROLLBACK")
@@ -48,12 +52,15 @@ final class RollbackFactory(client: ServiceFactory[Request, Result], statsReceiv
 
       private[this] def rollback(deadline: Time): Future[Unit] = {
         val elapsed = Stopwatch.start()
-        self(RollbackQuery).transform { result =>
+        // the rollback is `masked` in order to protect it from prior interrupts/raises.
+        // this statement should run regardless.
+        self(RollbackQuery).masked.transform { result =>
           rollbackLatencyStat.add(elapsed().inMillis)
           result match {
             case Return(_) => self.close(deadline)
-            case Throw(_: ChannelClosedException) =>
-              // Don't log the exception on ChannelClosedExceptions because it is noisy.
+            case Throw(_: ChannelClosedException) | Throw(_: ChannelWriteException) =>
+              // Don't log the exception on ChannelClosedExceptions/ChannelWriteException
+              // because it is noisy.
 
               // We want to close the connection if we can't issue a rollback
               // since we assume it isn't a "clean" connection to put back into
@@ -73,7 +80,9 @@ final class RollbackFactory(client: ServiceFactory[Request, Result], statsReceiv
       }
 
       private[this] def poisonAndClose(deadline: Time): Future[Unit] = {
-        self(PoisonConnectionRequest).transform { _ => self.close(deadline) }
+        // the poison req is `masked` in order to protect it from prior interrupts/raises.
+        // this statement should run regardless.
+        self(PoisonConnectionRequest).masked.transform { _ => self.close(deadline) }
       }
     }
 

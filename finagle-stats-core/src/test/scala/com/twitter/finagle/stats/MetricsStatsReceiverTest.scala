@@ -4,10 +4,14 @@ import com.twitter.finagle.stats.Helpers._
 import com.twitter.finagle.stats.MetricBuilder.CounterType
 import com.twitter.finagle.stats.MetricBuilder.GaugeType
 import com.twitter.finagle.stats.MetricBuilder.HistogramType
+import com.twitter.finagle.stats.MetricBuilder.Identity
+import com.twitter.finagle.stats.MetricBuilder.IdentityType
 import com.twitter.finagle.stats.exp.Expression
 import com.twitter.finagle.stats.exp.ExpressionSchema
 import com.twitter.finagle.stats.exp.ExpressionSchemaKey
 import com.twitter.finagle.stats.exp.HistogramComponent
+import com.twitter.conversions.DurationOps._
+import com.twitter.util.Time
 import org.scalatest.funsuite.AnyFunSuite
 
 object MetricsStatsReceiverTest {
@@ -65,19 +69,19 @@ object MetricsStatsReceiverTest {
       statsReceiver: StatsReceiver,
       name: Seq[String]
     ) =
-      statsReceiver.counter(statsReceiver.metricBuilder(CounterType).withName(name: _*))
+      statsReceiver.counter(MetricBuilder.newBuilder(CounterType).withName(name: _*))
     def addGauge(
       statsReceiver: StatsReceiver,
       name: Seq[String]
     )(
       f: => Float
     ) =
-      statsReceiver.addGauge(statsReceiver.metricBuilder(GaugeType).withName(name: _*))(f)
+      statsReceiver.addGauge(MetricBuilder.newBuilder(GaugeType).withName(name: _*))(f)
     def addHisto(
       statsReceiver: StatsReceiver,
       name: Seq[String]
     ) =
-      statsReceiver.stat(statsReceiver.metricBuilder(HistogramType).withName(name: _*))
+      statsReceiver.stat(MetricBuilder.newBuilder(HistogramType).withName(name: _*))
   }
 }
 
@@ -89,6 +93,32 @@ class MetricsStatsReceiverTest extends AnyFunSuite {
     assert("MetricsStatsReceiver" == sr.toString)
     assert("MetricsStatsReceiver/s1" == sr.scope("s1").toString)
     assert("MetricsStatsReceiver/s1/s2" == sr.scope("s1").scope("s2").toString)
+  }
+
+  test("testLockFreeStats") {
+    val metrics = Metrics.createDetached()
+    val sr = new MetricsStatsReceiver(metrics)
+    val stat1 = sr.stat(
+      MetricBuilder.forStat
+        .withName("name1"))
+    val stat2 = sr.stat(
+      MetricBuilder.forStat
+        .withName("name2")
+        .withMetricUsageHints(Set(MetricUsageHint.HighContention)))
+
+    val histograms = Time.withCurrentTimeFrozen { tc =>
+      metrics.histograms
+      stat1.add(2)
+      stat2.add(2)
+      tc.advance(60.seconds)
+      metrics.histograms
+    }
+
+    assertResult(2)(histograms.size)
+    histograms.foreach { histogram =>
+      assertResult(1)(histogram.value.count)
+      assertResult(2)(histogram.value.sum)
+    }
   }
 
   def testMetricsStatsReceiver(ctx: TestCtx): Unit = {
@@ -228,23 +258,26 @@ class MetricsStatsReceiverTest extends AnyFunSuite {
     val bHisto = sr.scope("test").stat("b")
     val cGauge = sr.scope(("test")).addGauge("c") { 1 }
 
-    val expression = ExpressionSchema(
-      "test_expression",
-      Expression(aCounter.metadata).plus(Expression(bHisto.metadata, HistogramComponent.Min)
-        .plus(Expression(cGauge.metadata)))
-    ).build()
+    sr.registerExpression(
+      ExpressionSchema(
+        "test_expression",
+        Expression(aCounter.metadata).plus(Expression(bHisto.metadata, HistogramComponent.Min)
+          .plus(Expression(cGauge.metadata)))
+      ))
 
     // what we expected as hydrated metric builders
     val aaSchema =
-      MetricBuilder(name = Seq("test", "a"), metricType = CounterType, statsReceiver = sr)
+      MetricBuilder(metricType = CounterType)
+        .withIdentity(Identity(Seq("test", "a"), Seq("a")))
+        .withHierarchicalOnly
     val bbSchema =
-      MetricBuilder(
-        name = Seq("test", "b"),
-        percentiles = BucketedHistogram.DefaultQuantiles,
-        metricType = HistogramType,
-        statsReceiver = sr)
+      MetricBuilder(percentiles = BucketedHistogram.DefaultQuantiles, metricType = HistogramType)
+        .withIdentity(Identity(Seq("test", "b"), Seq("b")))
+        .withHierarchicalOnly
     val ccSchema =
-      MetricBuilder(name = Seq("test", "c"), metricType = GaugeType, statsReceiver = sr)
+      MetricBuilder(metricType = GaugeType)
+        .withIdentity(Identity(Seq("test", "c"), Seq("c")))
+        .withHierarchicalOnly
 
     val expected_expression = ExpressionSchema(
       "test_expression",
@@ -262,26 +295,24 @@ class MetricsStatsReceiverTest extends AnyFunSuite {
     val sr = new MetricsStatsReceiver(metrics)
     val exporter = new MetricsExporter(metrics)
     val aCounter =
-      MetricBuilder(name = Seq("a"), metricType = CounterType, statsReceiver = sr)
+      MetricBuilder(name = Seq("a"), metricType = CounterType)
 
-    val expression = ExpressionSchema("test_expression", Expression(aCounter))
-      .build()
+    sr.registerExpression(ExpressionSchema("test_expression", Expression(aCounter)))
     assert(exporter.expressions.keySet.size == 1)
 
-    val expressionWithServiceName = ExpressionSchema("test_expression", Expression(aCounter))
-      .withServiceName("thrift")
-      .build()
+    sr.registerExpression(
+      ExpressionSchema("test_expression", Expression(aCounter))
+        .withServiceName("thrift"))
     assert(exporter.expressions.keySet.size == 2)
 
-    val expressionWithNamespace = ExpressionSchema("test_expression", Expression(aCounter))
-      .withNamespace("a", "b")
-      .build()
+    sr.registerExpression(
+      ExpressionSchema("test_expression", Expression(aCounter))
+        .withNamespace("a", "b"))
     assert(exporter.expressions.keySet.size == 3)
 
-    val expressionWithNamespaceAndServiceName =
+    sr.registerExpression(
       ExpressionSchema("test_expression", Expression(aCounter))
-        .withNamespace("a", "b").withServiceName("thrift")
-        .build()
+        .withNamespace("a", "b").withServiceName("thrift"))
     assert(exporter.expressions.keySet.size == 4)
   }
 
@@ -290,19 +321,19 @@ class MetricsStatsReceiverTest extends AnyFunSuite {
     val sr = new MetricsStatsReceiver(metrics)
     val exporter = new MetricsExporter(metrics)
     val aCounter =
-      MetricBuilder(name = Seq("a"), metricType = CounterType, statsReceiver = sr)
+      MetricBuilder(name = Seq("a"), metricType = CounterType)
 
     val bCounter =
-      MetricBuilder(name = Seq("b"), metricType = CounterType, statsReceiver = sr)
+      MetricBuilder(name = Seq("b"), metricType = CounterType)
 
-    val expression1 = ExpressionSchema("test_expression", Expression(aCounter))
-      .withNamespace("a", "b")
-      .build()
+    val expression1 = sr.registerExpression(
+      ExpressionSchema("test_expression", Expression(aCounter))
+        .withNamespace("a", "b"))
     assert(exporter.expressions.keySet.size == 1)
 
-    val expression2 = ExpressionSchema("test_expression", Expression(bCounter))
-      .withNamespace("a", "b")
-      .build()
+    val expression2 = sr.registerExpression(
+      ExpressionSchema("test_expression", Expression(bCounter))
+        .withNamespace("a", "b"))
     assert(exporter.expressions.keySet.size == 1)
 
     assert(exporter.expressions.values.head.expr == Expression(aCounter))
@@ -310,4 +341,45 @@ class MetricsStatsReceiverTest extends AnyFunSuite {
     assert(expression2.isThrow)
   }
 
+  test("identity type is resolved to HierarchicalOnly if it is undetermined") {
+    val metrics = Metrics.createDetached()
+    val sr = new MetricsStatsReceiver(metrics)
+    val counter = sr.counter("counter")
+    val gauge = sr.addGauge("gauge") { 1.0f }
+    val stat = sr.stat("stat")
+
+    assert(
+      counter.metadata.toMetricBuilder.get.identity.identityType == IdentityType.HierarchicalOnly)
+    assert(
+      gauge.metadata.toMetricBuilder.get.identity.identityType == IdentityType.HierarchicalOnly)
+    assert(stat.metadata.toMetricBuilder.get.identity.identityType == IdentityType.HierarchicalOnly)
+  }
+
+  test("identity type of Hierarchical only is not modified") {
+    val metrics = Metrics.createDetached()
+    val sr = new MetricsStatsReceiver(metrics)
+    val counter = sr.counter(MetricBuilder.forCounter.withName("counter").withHierarchicalOnly)
+    val gauge = sr.addGauge(MetricBuilder.forGauge.withName("gauge").withHierarchicalOnly) { 1.0f }
+    val stat = sr.stat(MetricBuilder.forStat.withName("stat").withHierarchicalOnly)
+
+    assert(
+      counter.metadata.toMetricBuilder.get.identity.identityType == IdentityType.HierarchicalOnly)
+    assert(
+      gauge.metadata.toMetricBuilder.get.identity.identityType == IdentityType.HierarchicalOnly)
+    assert(stat.metadata.toMetricBuilder.get.identity.identityType == IdentityType.HierarchicalOnly)
+  }
+
+  test("identity type of Full only is not modified") {
+    val metrics = Metrics.createDetached()
+    val sr = new MetricsStatsReceiver(metrics)
+    val counter = sr.counter(MetricBuilder.forCounter.withName("counter").withDimensionalSupport)
+    val gauge = sr.addGauge(MetricBuilder.forGauge.withName("gauge").withDimensionalSupport) {
+      1.0f
+    }
+    val stat = sr.stat(MetricBuilder.forStat.withName("stat").withDimensionalSupport)
+
+    assert(counter.metadata.toMetricBuilder.get.identity.identityType == IdentityType.Full)
+    assert(gauge.metadata.toMetricBuilder.get.identity.identityType == IdentityType.Full)
+    assert(stat.metadata.toMetricBuilder.get.identity.identityType == IdentityType.Full)
+  }
 }

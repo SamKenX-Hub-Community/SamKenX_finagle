@@ -4,26 +4,27 @@ import com.twitter.conversions.DurationOps._
 import com.twitter.finagle.Address.Inet
 import com.twitter.finagle._
 import com.twitter.finagle.loadbalancer.EndpointFactory
-import com.twitter.finagle.loadbalancer.PanicMode
 import com.twitter.finagle.loadbalancer.NodeT
+import com.twitter.finagle.loadbalancer.NotClosableEndpointFactoryProxy
+import com.twitter.finagle.loadbalancer.PanicMode
 import com.twitter.finagle.stats.InMemoryStatsReceiver
 import com.twitter.finagle.stats.NullStatsReceiver
 import com.twitter.finagle.util.Rng
 import com.twitter.util.Activity
 import com.twitter.util.Await
 import com.twitter.util.Duration
+import com.twitter.util.Future
 import com.twitter.util.NullTimer
+import com.twitter.util.Time
 import com.twitter.util.Var
 import java.net.InetSocketAddress
 import org.scalactic.source.Position
 import org.scalatest.Tag
 import org.scalatest.funsuite.AnyFunSuite
 
-class ApertureTest extends BaseApertureTest(doesManageWeights = false)
+class ApertureTest extends BaseApertureTest()
 
-abstract class BaseApertureTools(doesManageWeights: Boolean)
-    extends AnyFunSuite
-    with ApertureSuite {
+abstract class BaseApertureTools() extends AnyFunSuite with ApertureSuite {
 
   /**
    * A simple aperture balancer which doesn't have a controller or load metric
@@ -38,7 +39,6 @@ abstract class BaseApertureTools(doesManageWeights: Boolean)
    */
   private[aperture] class Bal extends TestBal {
 
-    val manageWeights: Boolean = doesManageWeights
     protected def nodeLoad: Double = 0.0
 
     lazy val statsReceiver: InMemoryStatsReceiver = new InMemoryStatsReceiver
@@ -54,7 +54,6 @@ abstract class BaseApertureTools(doesManageWeights: Boolean)
       // the internal behavior of aperture.
       def id: Int = 0
       def load: Double = nodeLoad
-      def pending: Int = 0
       override val token: Int = 0
     }
 
@@ -65,8 +64,7 @@ abstract class BaseApertureTools(doesManageWeights: Boolean)
   }
 }
 
-abstract class BaseApertureTest(doesManageWeights: Boolean)
-    extends BaseApertureTools(doesManageWeights) {
+abstract class BaseApertureTest() extends BaseApertureTools() {
 
   // Ensure the flag value is 12 since many of the tests depend on it.
   override protected def test(
@@ -98,8 +96,7 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
         timer = new NullTimer,
         emptyException = new NoBrokersAvailableException,
         useDeterministicOrdering = None,
-        eagerConnections = false,
-        manageWeights = doesManageWeights
+        eagerConnections = false
       )
     }
   }
@@ -121,8 +118,7 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
       timer = new NullTimer,
       emptyException = new NoBrokersAvailableException,
       useDeterministicOrdering = Some(true),
-      eagerConnections = false,
-      manageWeights = doesManageWeights
+      eagerConnections = false
     )
 
     assert(!stats.gauges.contains(Seq("loadband", "offered_load_ema")))
@@ -146,8 +142,7 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
       timer = new NullTimer,
       emptyException = new NoBrokersAvailableException,
       useDeterministicOrdering = Some(false),
-      eagerConnections = false,
-      manageWeights = doesManageWeights
+      eagerConnections = false
     )
 
     assert(stats.gauges.contains(Seq("loadband", "offered_load_ema")))
@@ -172,8 +167,7 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
       timer = new NullTimer,
       emptyException = new NoBrokersAvailableException,
       useDeterministicOrdering = Some(false),
-      eagerConnections = false,
-      manageWeights = doesManageWeights
+      eagerConnections = false
     )
 
     assert(stats.gauges.contains(Seq("loadband", "offered_load_ema")))
@@ -199,8 +193,7 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
       timer = new NullTimer,
       emptyException = new NoBrokersAvailableException,
       useDeterministicOrdering = Some(true),
-      eagerConnections = true,
-      manageWeights = doesManageWeights
+      eagerConnections = true
     )
     assert(factories.forall(_.total == 1))
 
@@ -230,8 +223,7 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
         timer = new NullTimer,
         emptyException = new NoBrokersAvailableException,
         useDeterministicOrdering = Some(true),
-        eagerConnections = false,
-        manageWeights = manageWeights
+        eagerConnections = false
       )
       assert(stats.counters(Seq("rebuilds")) == 1)
 
@@ -266,8 +258,7 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
         timer = new NullTimer,
         emptyException = new NoBrokersAvailableException,
         useDeterministicOrdering = Some(true),
-        eagerConnections = false,
-        manageWeights = manageWeights
+        eagerConnections = false
       )
       assert(stats.counters(Seq("rebuilds")) == 1)
 
@@ -452,7 +443,7 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
     ProcessCoordinate.setCoordinate(instanceId = 0, totalInstances = 12)
     bal.update(counts.range(24))
     bal.rebuildx()
-    assert(bal.isDeterministicAperture)
+    assert(bal.isWeightedAperture)
     assert(bal.minUnitsx == 12)
 
     // mark all endpoints within the aperture as busy
@@ -502,7 +493,7 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
     ProcessCoordinate.setCoordinate(instanceId = 0, totalInstances = 12)
     bal.update(counts.range(24))
     bal.rebuildx()
-    assert(bal.isDeterministicAperture)
+    assert(bal.isWeightedAperture)
     assert(bal.minUnitsx == 12)
     bal.applyn(2000)
 
@@ -518,7 +509,7 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
     ProcessCoordinate.setCoordinate(instanceId = 1, totalInstances = 4)
     bal.update(counts.range(18))
     bal.rebuildx()
-    assert(bal.isDeterministicAperture)
+    assert(bal.isWeightedAperture)
     assert(bal.minUnitsx == 12)
     bal.applyn(2000)
 
@@ -589,7 +580,7 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
     ProcessCoordinate.setCoordinate(0, 150)
     bal.update(Vector.tabulate(150)(Factory))
     bal.rebuildx()
-    assert(bal.isDeterministicAperture)
+    assert(bal.isWeightedAperture)
     // ignore 150, since we are using d-aperture and instead
     // default to 12.
     assert(bal.minUnitsx == 12)
@@ -611,7 +602,7 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
     ProcessCoordinate.setCoordinate(0, 1)
     bal.update(counts.range(3))
     bal.rebuildx()
-    assert(bal.isDeterministicAperture)
+    assert(bal.isWeightedAperture)
     assert(bal.minUnitsx == 3)
     bal.applyn(3000)
 
@@ -636,7 +627,7 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
     ProcessCoordinate.unsetCoordinate()
     bal.update(counts.range(3))
     bal.rebuildx()
-    assert(bal.isDeterministicAperture)
+    assert(bal.isWeightedAperture)
     assert(bal.minUnitsx == 3)
     bal.applyn(3000)
 
@@ -681,5 +672,49 @@ abstract class BaseApertureTest(doesManageWeights: Boolean)
     val hash4 = getVectorHash
 
     assert(hash1 != hash4)
+  }
+
+  test("can't close notClosableEndpoint") {
+    def newFac() = new EndpointFactory[Unit, Unit] {
+      val address: Address = Address.Failed(new Exception)
+      var _status: Status = Status.Open
+      def remake(): Unit = ()
+
+      def apply(conn: ClientConnection): Future[Service[Unit, Unit]] = Future.never
+      override def status: Status = _status
+
+      def close(deadline: Time): Future[Unit] = {
+        _status = Status.Closed
+        Future.Done
+      }
+    }
+
+    val bal = new Bal
+
+    val f1, f2, f3 = newFac()
+    val nc1 = NotClosableEndpointFactoryProxy(f1)
+    bal.update(Vector(nc1, f2, f3))
+
+    assert(f1.status == Status.Open)
+    assert(f2.status == Status.Open)
+    assert(f3.status == Status.Open)
+    assert(nc1.status == Status.Open)
+
+    // close balancer won't close endpoint1
+    Await.result(bal.close(), 5.seconds)
+    assert(f1.status == Status.Open)
+    assert(f2.status == Status.Closed)
+    assert(f3.status == Status.Closed)
+    assert(nc1.status == Status.Open)
+
+    // close the proxy won't close endpoint1
+    Await.result(nc1.close(), 5.seconds)
+    assert(f1.status == Status.Open)
+    assert(nc1.status == Status.Open)
+
+    // close the endpoint1 directly close it
+    Await.result(f1.close(), 5.seconds)
+    assert(f1.status == Status.Closed)
+    assert(nc1.status == Status.Closed)
   }
 }

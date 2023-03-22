@@ -1,11 +1,20 @@
 package com.twitter.finagle.http.filter
 
 import com.twitter.finagle.Service
-import com.twitter.finagle.http.{Request, Response}
-import com.twitter.finagle.stats.MetricBuilder.{CounterType, HistogramType}
-import com.twitter.finagle.stats.{InMemoryStatsReceiver, MetricBuilder}
-import com.twitter.util.{Await, Duration, Future, Stopwatch, Time}
-import org.mockito.Mockito.{spy, verify}
+import com.twitter.finagle.http.Request
+import com.twitter.finagle.http.Response
+import com.twitter.finagle.stats.MetricBuilder.CounterType
+import com.twitter.finagle.stats.MetricBuilder.HistogramType
+import com.twitter.finagle.stats.InMemoryStatsReceiver
+import com.twitter.finagle.stats.MetricBuilder
+import com.twitter.finagle.stats.NameTranslatingStatsReceiver
+import com.twitter.util.Await
+import com.twitter.util.Duration
+import com.twitter.util.Future
+import com.twitter.util.Stopwatch
+import com.twitter.util.Time
+import org.mockito.Mockito.spy
+import org.mockito.Mockito.verify
 import org.scalatest.funsuite.AnyFunSuite
 
 class StatsFilterTest extends AnyFunSuite {
@@ -19,8 +28,12 @@ class StatsFilterTest extends AnyFunSuite {
     }
   }
 
+  private class FullTranlationInMemoryStatsReceiver extends InMemoryStatsReceiver {
+    override def scopeTranslation = NameTranslatingStatsReceiver.FullTranslation
+  }
+
   test("increment stats") {
-    val receiver = spy(new InMemoryStatsReceiver)
+    val receiver = new InMemoryStatsReceiver
 
     val filter = new StatsFilter(receiver, Stopwatch.timeMillis) andThen service
 
@@ -33,7 +46,7 @@ class StatsFilterTest extends AnyFunSuite {
   }
 
   test("status and time counters and stats are memoized") {
-    val receiver = spy(new InMemoryStatsReceiver)
+    val receiver = spy(new FullTranlationInMemoryStatsReceiver)
 
     val filter = new StatsFilter(receiver, Stopwatch.timeMillis) andThen service
 
@@ -43,25 +56,9 @@ class StatsFilterTest extends AnyFunSuite {
     }
 
     // Verify that the counters and stats were only created once
-    verify(receiver).counter(
-      MetricBuilder(
-        name = Seq("status", "404"),
-        metricType = CounterType,
-        statsReceiver = receiver))
-    verify(receiver).counter(
-      MetricBuilder(
-        name = Seq("status", "4XX"),
-        metricType = CounterType,
-        statsReceiver = receiver))
-    verify(receiver).stat(
-      MetricBuilder(
-        name = Seq("time", "404"),
-        metricType = HistogramType,
-        statsReceiver = receiver))
-    verify(receiver).stat(
-      MetricBuilder(
-        name = Seq("time", "4XX"),
-        metricType = HistogramType,
-        statsReceiver = receiver))
+    verify(receiver).counter(MetricBuilder(name = Seq("status", "404"), metricType = CounterType))
+    verify(receiver).counter(MetricBuilder(name = Seq("status", "4XX"), metricType = CounterType))
+    verify(receiver).stat(MetricBuilder(name = Seq("time", "404"), metricType = HistogramType))
+    verify(receiver).stat(MetricBuilder(name = Seq("time", "4XX"), metricType = HistogramType))
   }
 }

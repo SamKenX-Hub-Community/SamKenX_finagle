@@ -1,0 +1,94 @@
+scala_library(
+    name = "lib",
+    sources = ["**/benchmark/*.scala"],
+    platform = "java8",
+    tags = [
+        "bazel-incompatible-scaladoc",  # see http://go/bazel-incompatible-scaladoc
+    ],
+    dependencies = [
+        "3rdparty/jvm/com/github/luben:zstd-jni",
+        "3rdparty/jvm/io/netty:netty4-codec-http",
+        "3rdparty/jvm/org/apache/curator:curator-framework",
+        "3rdparty/jvm/org/apache/curator:curator-test",
+        "3rdparty/jvm/org/apache/thrift:libthrift",
+        "3rdparty/jvm/org/apache/zookeeper:zookeeper-client",
+        "3rdparty/jvm/org/openjdk/jmh:jmh-core",
+        "3rdparty/jvm/org/scala-lang:scala-library",
+        "finagle/finagle-benchmark-thrift/src/main/thrift:thrift-java",
+        "finagle/finagle-benchmark-thrift/src/main/thrift:thrift-scala",
+        "finagle/finagle-core/src/main",
+        "finagle/finagle-core/src/test/scala:injectors-resolvers",
+        "finagle/finagle-core/src/test/scala:stringprotocol",
+        "finagle/finagle-exp/src/main/scala",
+        "finagle/finagle-http/src/main/scala",
+        "finagle/finagle-memcached/src/main/scala",
+        "finagle/finagle-mux/src/main/scala",
+        "finagle/finagle-mysql/src/main/scala",
+        "finagle/finagle-netty4/src/main/scala",
+        "finagle/finagle-postgresql/src/main/scala/com/twitter/finagle",
+        "finagle/finagle-serversets/src/main/scala",
+        "finagle/finagle-stats/src/main/scala",
+        "finagle/finagle-thrift/src/main/java",
+        "finagle/finagle-thrift/src/main/scala",
+        "finagle/finagle-thriftmux/src/main/scala",
+        "finagle/finagle-zipkin-scribe/src/main/scala",
+        "scrooge/scrooge-core/src/main/scala",
+        "util/util-app/src/main/scala",
+        "util/util-core:scala",
+        "util/util-logging/src/main/scala",
+        "util/util-stats/src/main/scala",
+    ],
+)
+
+scala_benchmark_jmh(
+    name = "jmh",
+    sources = [
+        "**/*.scala",
+    ],
+    platform = "java8",
+    dependencies = [":lib"],
+)
+
+jvm_binary(
+    name = "jmh-jvm",
+    deps = [
+        "@io_bazel_rules_scala//jmh:jmh_classpath",
+        ":jmh_compiled_benchmark_lib",
+    ],
+    main_class = "org.openjdk.jmh.Main",
+    unused_dependency_checker_mode = "off",
+)
+
+jvm_app(
+    name = "jmh-bundle",
+    basename = "finagle-benchmark-dist",
+    binary = ":jmh-jvm",
+    tags = ["bazel-compatible"],
+)
+
+jvm_binary(
+    name = "lbsim",
+    main = "com.twitter.finagle.balancersim.Simulation",
+    sources = ["**/balancersim/*.scala"],
+    platform = "java8",
+    dependencies = [
+        ":lib",
+        "finagle/finagle-benchmark/src/main/resources",
+    ],
+)
+
+jvm_binary(
+    name = "hello-server",
+    main = "com.twitter.finagle.thrift.HelloServer",
+    sources = ["**/thrift/HelloServer.scala"],
+    platform = "java8",
+    dependencies = [":lib"],
+)
+
+jvm_binary(
+    name = "serverset-service",
+    main = "com.twitter.finagle.serverset2.LocalServerSetService",
+    sources = ["**/serverset2/LocalServerSetService.scala"],
+    platform = "java8",
+    dependencies = [":lib"],
+)

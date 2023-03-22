@@ -19,7 +19,6 @@ import com.twitter.finagle.service._
 import com.twitter.finagle.stats.InMemoryStatsReceiver
 import com.twitter.finagle.stats.LoadedStatsReceiver
 import com.twitter.finagle.stats.NullStatsReceiver
-import com.twitter.finagle.stats.StandardStatsReceiver
 import com.twitter.finagle.tracing.Trace
 import com.twitter.finagle.util.DefaultTimer
 import com.twitter.io.Buf
@@ -839,17 +838,29 @@ abstract class AbstractEndToEndTest
       s"$implName (streaming): " +
         "request discard terminates remote stream producer"
     ) {
+      val message = "hello"
+      val finished = Promise[Unit]()
       val s = Service.mk[Request, Response] { req =>
         val res = Response()
         res.setChunked(true)
-        def go =
-          for {
-            Some(c) <- req.reader.read()
-            _ <- res.writer.write(c)
-            _ <- res.close()
-          } yield ()
-        // discard the reader, which should terminate the drip.
-        go ensure req.reader.discard()
+        def go(bytes: Int): Future[Unit] = {
+          if (bytes == message.length) res.close()
+          else
+            req.reader.read().flatMap {
+              case Some(bs) => res.writer.write(bs).before(go(bytes + bs.length))
+              case None => res.close()
+            }
+        }
+        go(0)
+
+        // This seems to be necessary for HTTP/1.1 since we can't signal half-closed to the client
+        // so it appears that the "connection closed" situation is propagating faster than the last
+        // chunk (maybe only chunk) of the response. Otherwise, we could just use the Future from
+        // the `go` call to terminate.
+        finished.before {
+          req.reader.discard()
+          Future.Unit
+        }
 
         Future.value(res)
       }
@@ -859,10 +870,14 @@ abstract class AbstractEndToEndTest
       req.setChunked(true)
       val resf = client(req)
 
-      await(req.writer.write(buf("hello")))
+      await(req.writer.write(buf(message)))
 
       val contentf = resf flatMap { res => BufReader.readAll(res.reader) }
-      assert(await(contentf) == Buf.Utf8("hello"))
+      // TODO: with offload on this now throws a ChannelClosedException
+      assert(await(contentf) == Buf.Utf8(message))
+
+      // Terminate the response stream.
+      finished.setDone()
 
       // drip should terminate because the request is discarded.
       intercept[ReaderDiscardedException] { await(drip(req.writer)) }
@@ -2328,7 +2343,6 @@ abstract class AbstractEndToEndTest
     val sr = new InMemoryStatsReceiver()
     val loadedSr = LoadedStatsReceiver.self
     LoadedStatsReceiver.self = builtinSr
-    StandardStatsReceiver.serverCount.set(0)
     val server = serverImpl()
       .withStatsReceiver(sr)
       .withResponseClassifier(ResponseClassifier.Default)
@@ -2345,12 +2359,19 @@ abstract class AbstractEndToEndTest
     assert(builtinSr.counter("standard-service-metric-v1", "srv", "requests")() == 3)
     assert(sr.counter("requests")() == 3)
     assert(sr.counter("success")() == 3)
+
+    val serverId = builtinSr.counters.keys.collectFirst {
+      case Seq("standard-service-metric-v1", "srv", "http", server, _)
+          if server.startsWith("server-") =>
+        server
+    }.get
+
     assert(
       builtinSr
-        .counter("standard-service-metric-v1", "srv", "http", "server-0", "requests")() == 3)
+        .counter("standard-service-metric-v1", "srv", "http", serverId, "requests")() == 3)
     assert(
       builtinSr
-        .counter("standard-service-metric-v1", "srv", "http", "server-0", "success")() == 2)
+        .counter("standard-service-metric-v1", "srv", "http", serverId, "success")() == 2)
     LoadedStatsReceiver.self = loadedSr
     await(client.close())
     await(server.close())

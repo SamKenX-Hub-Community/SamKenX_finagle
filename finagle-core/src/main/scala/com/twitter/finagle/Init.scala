@@ -4,10 +4,13 @@ import com.twitter.concurrent.Once
 import com.twitter.finagle.exp.FinagleScheduler
 import com.twitter.finagle.loadbalancer.aperture
 import com.twitter.finagle.loadbalancer.aperture.ProcessCoordinate.FromInstanceId
-import com.twitter.finagle.stats.{DefaultStatsReceiver, FinagleStatsReceiver}
+import com.twitter.finagle.stats.DefaultStatsReceiver
+import com.twitter.finagle.stats.FinagleStatsReceiver
 import com.twitter.finagle.client.StackClient
 import com.twitter.finagle.server.StackServer
-import com.twitter.finagle.util.{DefaultLogger, LoadService}
+import com.twitter.finagle.stats.Verbosity
+import com.twitter.finagle.util.DefaultLogger
+import com.twitter.finagle.util.LoadService
 import com.twitter.jvm.JvmStats
 import com.twitter.util.FuturePool
 import java.util.concurrent.atomic.AtomicReference
@@ -36,7 +39,7 @@ private[twitter] object Init {
       fpoolStats.addGauge("pool_size") { pool.poolSize },
       fpoolStats.addGauge("active_tasks") { pool.numActiveTasks },
       fpoolStats.addGauge("completed_tasks") { pool.numCompletedTasks },
-      apertureStats.addGauge("coordinate") {
+      apertureStats.addGauge(Verbosity.ShortLived, "coordinate") {
         aperture.ProcessCoordinate() match {
           case Some(coord) => coord.offset.toFloat
           // We know the coordinate's range is [0, 1.0), so anything outside
@@ -44,7 +47,7 @@ private[twitter] object Init {
           case None => -1f
         }
       },
-      apertureStats.addGauge("peerset_size") {
+      apertureStats.addGauge(Verbosity.ShortLived, "peerset_size") {
         aperture.ProcessCoordinate() match {
           case Some(FromInstanceId(_, size)) => size.toFloat
           case _ => -1f
@@ -109,12 +112,19 @@ private[twitter] object Init {
     _finagleVersion.set(p.getProperty("version", unknownVersion))
     _finagleBuildRevision.set(p.getProperty("build_revision", unknownVersion))
 
-    LoadService[StackTransformer]().foreach { nt => StackServer.DefaultTransformer.append(nt) }
+    // Load up the client and server `Stack.Transformer`s.
+    LoadService[ServerStackTransformer]().foreach { nt =>
+      StackServer.DefaultTransformer.append(nt)
+    }
+    LoadService[ClientStackTransformer]().foreach { nt =>
+      StackClient.DefaultTransformer.append(nt)
+    }
     // we split out params injection from stack transformation because params are typically
     // injected at the top of the stack, and it can create confusing deps to inject them via
     // StackTransformers.  at the same time, we occasionally want to inject parameters
     // before we ever call Stack#make.  this gives us an opportunity to do it.
     LoadService[ClientParamsInjector]().foreach { nt => StackClient.DefaultInjectors.append(nt) }
+    LoadService[ServerParamsInjector]().foreach { nt => StackServer.DefaultInjectors.append(nt) }
 
     log.info(
       "Finagle version %s (rev=%s) built at %s".format(

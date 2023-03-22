@@ -24,6 +24,11 @@ object dnsCacheSize extends GlobalFlag(16000L, "Maximum size of DNS resolution c
 private[serverset2] object Zk2Resolver {
 
   /**
+   * A sentinel weight value.
+   */
+  val WeightFilter: Double = -1.0
+
+  /**
    * A representation of an Addr accompanied by its total size and the number of
    * members that are in "limbo".
    */
@@ -43,13 +48,51 @@ private[serverset2] object Zk2Resolver {
    */
   def statsOf(hostname: String): String =
     hostname.takeWhile(_ != ',').split('.').take(2).mkString(".").take(30)
+
+  /**
+   * Merge individual ServerSets into a single Var[Addr].
+   *
+   * First, all bound Addrs are merged together. If the result is empty,
+   * we return one of: Addr.Pending, Addr.Neg, or Addr.Failed.
+   *
+   * When merging non-bound Addrs, pending states have higher precedence
+   * than negative states, since they represent potential bound Addrs.
+   * If all resolutions fail, we return Addr.Failed.
+   *
+   * Note: `merge` does _not_ preserve per Addr metadata.
+   */
+  def merge(vas: Seq[Var[Addr]]): Var[Addr] = {
+    if (vas.isEmpty) Var.value(Addr.Neg)
+    else if (vas.size == 1) vas.head
+    else {
+      val va = Var.collectIndependent(vas).map { addrs =>
+        val bound = addrs.collect {
+          case Addr.Bound(as, _) => as
+        }.flatten
+        if (bound.nonEmpty) Addr.Bound(bound.toSet)
+        else if (addrs.contains(Addr.Pending)) Addr.Pending
+        else if (addrs.contains(Addr.Neg)) Addr.Neg
+        else {
+          addrs.collectFirst {
+            case Addr.Failed(e) => e
+          } match {
+            case Some(e) => Addr.Failed(e)
+            case None => Addr.Failed(new Exception("Unexpected error"))
+          }
+        }
+      }
+      Var.async(Addr.Pending: Addr) { u =>
+        va.changes.dedup.register(Witness(u))
+      }
+    }
+  }
 }
 
 /**
  * A [[com.twitter.finagle.Resolver]] for the "zk2" service discovery scheme.
  *
- * Resolution is achieved by looking up registered ServerSet paths within a
- * service discovery ZooKeeper cluster. See `Zk2Resolver.bind` for details.
+ * Resolution is achieved by looking up registered ServerSet paths within the specified
+ * service discovery ZooKeeper cluster(s). See `Zk2Resolver.bind` for details.
  *
  * @param statsReceiver maintains stats and gauges used in resolution
  *
@@ -159,24 +202,26 @@ class Zk2Resolver(
         scoped.provideGauge("limbo") { nlimbo }
         scoped.provideGauge("size") { size }
 
-        // First, convert the Op-based serverset address to a
-        // Var[Addr], then select only endpoints that are alive
-        // and match any specified endpoint name and shard ID.
+        // Convert the Op-based serverset address to a Var[Addr].
         val rawServerSetAddr: Var[Addr] = serverSetOf((discoverer, path)).flatMap {
           case Activity.Pending => Var.value(Addr.Pending)
           case Activity.Failed(exc) => Var.value(Addr.Failed(exc))
           case Activity.Ok(weightedEntries) =>
-            val endpoint = endpointOption.orNull
+            // Select endpoints that are: alive, have a valid weight,
+            // and match the provided endpoint name + shard number.
+            def predicate(endpoint: Endpoint, weight: Double): Boolean = {
+              endpoint.status == Endpoint.Status.Alive &&
+              endpoint.host != null &&
+              weight != WeightFilter &&
+              endpoint.names.contains(endpointOption.orNull) &&
+              shardOption.forall { s => s == endpoint.shard && endpoint.shard != Int.MinValue }
+            }
+
             val hosts: Seq[(String, Int, Addr.Metadata)] = weightedEntries.collect {
-              case (
-                    Endpoint(names, host, port, shardId, Endpoint.Status.Alive, _, metadata),
-                    weight)
-                  if names.contains(endpoint) &&
-                    host != null &&
-                    shardOption.forall { s => s == shardId && shardId != Int.MinValue } =>
-                val shardIdOpt = if (shardId == Int.MinValue) None else Some(shardId)
-                val zkMetadata = ZkMetadata.toAddrMetadata(ZkMetadata(shardIdOpt, metadata))
-                (host, port, zkMetadata + (WeightedAddress.weightKey -> weight))
+              case (e: Endpoint, weight) if predicate(e, weight) =>
+                val shardOpt = if (e.shard == Int.MinValue) None else Some(e.shard)
+                val zkMetadata = ZkMetadata.toAddrMetadata(ZkMetadata(shardOpt, e.metadata))
+                (e.host, e.port, zkMetadata + (WeightedAddress.weightKey -> weight))
             }
 
             if (chatty()) {
@@ -228,7 +273,7 @@ class Zk2Resolver(
                 size = _size
 
                 if (clientHealth == ClientHealth.Unhealthy) {
-                  logger.info("ZkResolver reports unhealthy. resolution moving to Addr.Pending")
+                  logger.info("Zk2Resolver reports unhealthy. Resolution moving to Addr.Pending")
                   Addr.Pending
                 } else addr
             }
@@ -270,14 +315,16 @@ class Zk2Resolver(
    * directly (e.g. ServerSet Namers).
    */
   private[twitter] def addrOf(
-    hosts: String,
+    clusters: String,
     path: String,
     endpoint: Option[String],
     shardId: Option[Int]
-  ): Var[Addr] = addrOf_((mkDiscoverer(hosts), path, endpoint, shardId))
+  ): Var[Addr] = merge(clusters.split("#").map { hosts =>
+    addrOf_(mkDiscoverer(hosts), path, endpoint, shardId)
+  })
 
-  private[twitter] def addrOf(hosts: String, path: String, endpoint: Option[String]): Var[Addr] =
-    addrOf(hosts, path, endpoint, None)
+  private[twitter] def addrOf(clusters: String, path: String, endpoint: Option[String]): Var[Addr] =
+    addrOf(clusters, path, endpoint, None)
 
   /**
    * Bind a string into a variable address using the zk2 scheme.
@@ -288,21 +335,26 @@ class Zk2Resolver(
    *
    * Argument strings must adhere to either of the following formats:
    *
-   *     <hosts>:2181!<path>
-   *     <hosts>:2181!<path>!<endpoint>
+   *     <clusters>!<path>
+   *     <clusters>!<path>!<endpoint>
    *
    * where
    *
-   * - <hosts>: The hostname(s) of service discovery ZooKeeper cluster
+   * - <clusters>: One or more service discovery ZooKeeper clusters (delimited by "#")
    * - <path>: A ServerSet path (e.g. /twitter/service/userservice/prod/server)
    * - <endpoint>: An endpoint name (optional)
+   *
+   * Examples:
+   *
+   *     "zk2!<host>:2181!/twitter/service/userservice/prod/server!http"
+   *     "zk2!<host1>:2181#<host2>:2181#<host3>:2181!/twitter/service/userservice/prod/server"
    */
   def bind(arg: String): Var[Addr] = arg.split("!") match {
-    case Array(hosts, path) =>
-      addrOf(hosts, path, None)
+    case Array(clusters, path) =>
+      addrOf(clusters, path, None)
 
-    case Array(hosts, path, endpoint) =>
-      addrOf(hosts, path, Some(endpoint))
+    case Array(clusters, path, endpoint) =>
+      addrOf(clusters, path, Some(endpoint))
 
     case _ =>
       throw new IllegalArgumentException(s"Invalid address '$arg'")

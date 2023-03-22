@@ -7,6 +7,7 @@ scala_library(
         "com/twitter/finagle/server/utils/StringServer.scala",
     ],
     compiler_option_sets = ["fatal_warnings"],
+    platform = "java8",
     tags = ["bazel-compatible"],
     dependencies = [
         "finagle/finagle-core",
@@ -24,8 +25,27 @@ scala_library(
         "com/twitter/finagle/pushsession/utils/MockPushSession.scala",
     ],
     compiler_option_sets = ["fatal_warnings"],
+    platform = "java8",
     tags = ["bazel-compatible"],
     dependencies = [
+        "finagle/finagle-core/src/main",
+    ],
+)
+
+scala_library(
+    name = "injectors-resolvers",
+    sources = [
+        "com/twitter/finagle/ResolverTest.scala",
+        "com/twitter/finagle/TestAsyncInetResolver.scala",
+        "com/twitter/finagle/client/TestClientParamsInjector.scala",
+        "com/twitter/finagle/server/TestServerParamsInjector.scala",
+        "com/twitter/finagle/util/params.scala",
+    ],
+    compiler_option_sets = ["fatal_warnings"],
+    platform = "java8",
+    tags = ["bazel-compatible"],
+    dependencies = [
+        "3rdparty/jvm/org/scalatest",
         "finagle/finagle-core/src/main",
     ],
 )
@@ -36,6 +56,7 @@ junit_tests(
         "**/*.scala",
     ],
     compiler_option_sets = ["fatal_warnings"],
+    platform = "java8",
     # env_local is tag for bazel only, added due to DPB-14188
     tags = ["bazel-compatible"],
     dependencies = [
@@ -45,15 +66,16 @@ junit_tests(
         "3rdparty/jvm/io/netty:netty4-codec-http",
         "3rdparty/jvm/junit",
         "3rdparty/jvm/org/hdrhistogram",
-        "3rdparty/jvm/org/mockito:mockito-all",
+        "3rdparty/jvm/org/mockito:mockito-core",
         "3rdparty/jvm/org/scalacheck",
         "3rdparty/jvm/org/scalatest",
         "3rdparty/jvm/org/scalatestplus:junit",
-        "3rdparty/jvm/org/scalatestplus:mockito-1-10",
+        "3rdparty/jvm/org/scalatestplus:mockito",
         "3rdparty/jvm/org/scalatestplus:scalacheck",
         "finagle/finagle-core/src/main",
         "finagle/finagle-core/src/test/resources",
         "finagle/finagle-netty4",
+        "finagle/finagle-stats-core/src/main/scala",
         "finagle/finagle-toggle/src/main/scala",
         "util/util-app/src/main/scala",
         "util/util-core:scala",
@@ -65,7 +87,7 @@ junit_tests(
         "util/util-routing/src/main/scala/com/twitter/util/routing",
         "util/util-security/src/main/scala/com/twitter/util/security",
         "util/util-stats",
-        "util/util-test/src/main/scala/com/twitter/util/testing",
+        "util/util-test/src/main/scala/com/twitter/util/testing:no-mockito",
         "util/util-tunable/src/main/scala",
     ],
 )

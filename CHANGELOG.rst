@@ -9,11 +9,94 @@ Unreleased
 
 New Features
 ~~~~~~~~~~~~
-* finagle-core: Introduce panic mode in load balancers. Configure the threshold for
-  panic mode to start using `withLoadBalancer.panicMode`. ``PHAB_ID=D879034``
+
+* finagle-stats: A new implementation of BucketedHistogram that works better under high contention, but requires
+  more memory. ``PHAB_ID=D1028784``
+
+
+Runtime Behavior Changes
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+* finagle: Bump version of Jackson to 2.14.2. ``PHAB_ID=D1049772``
+
+* finagle: Update JSqlParser to version 4.6 ``PHAB_ID=D1054717``
+
+22.12.0
+-------
+
+New Features
+~~~~~~~~~~~~
+
+* finagle-core: Enable tracing for individual fanout requests via the FanoutTracer. 
+  ``PHAB_ID=D974564`` 
+* finagle-core: Added helpers for local and peer ServiceIdentity to `SslSessionInfo`.
+  ``PHAB_ID=D973030``
+* finagle-core: Expose `StackClient.DefaultInjectors`.  ``PHAB_ID=D1009348``
+* finagle-http: RequestBuilder's `c.t.f.http.FileElement` now has `isText` (default: false)
+  attribute. When set to `true`, no `Content-Transfer-Encoding` header is populated on the request.
+  ``PHAB_ID=D969859``
+* finagle-http: When Finagle Http servers are secured with S2S, write `c.t.finagle.SslSessionInfo#peerIdentity` 
+  as remote user in access log. ``PHAB_ID=D988224``
+
+Runtime Behavior Changes
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+* util: Bump version of Jackson to 2.14.1. ``PHAB_ID=D1025778``
+
+* finagle-http: Remove DeadlineFilter from Server stack. ``PHAB_ID=D964479``
+
+* finagle-core: Ensure BackupRequestFilter respects maxExtraLoad. For low QPS finagle clients
+  this may mean fewer backup requests, so such clients can increase their maxExtraLoad setting
+  if they actually want higher backup request rates. ``PHAB_ID=D981168``
+
+* finagle-serversets: Remove Endpoints with a weight of -1.0 from resolved zookeeper serversets
+  Negative weights aren't normally valid so we use "-1.0" as a specific signal to not include
+  the node in the resolved serverset returned to the client.  This is useful for various types
+  of testing. ``PHAB_ID=D1001342``
 
 Breaking API Changes
 ~~~~~~~~~~~~~~~~~~~~
+
+* finagle-core: `DeadlineFilter.module` has been replaced with `DeadlineFilter.clientModule`
+  and `DeadlineFilter.serverModule`. ``PHAB_ID=D943426``
+
+* finagle-http: `c.t.f.Http.Http2` and `c.t.f.Http.Netty4Impl` values were removed because they
+  were confusing. Use `.withHttp2` and `.withNoHttp2` to toggle HTTP/2 support ON and OFF
+  respectively.  ``PHAB_ID=D935292``
+
+* finagle-core: Allow users of MethodBuilder.idempotent to specify non-retryable responses for
+  idempotent methods. Previously these were overridden to be retryable.  ``PHAB_ID=D999969``
+
+* finagle-core: The `com.twitter.finagle.offload.queueSize` has been removed. ``PHAB_ID=D1011484``
+
+22.7.0
+------
+* finagle-thrift: Changing visibility of InputBuffer and OutputBuffer from [finagle] to [twitter].
+ ``PHAB_ID=D938475``
+
+New Features
+~~~~~~~~~~~~
+* finagle-core: Introduce panic mode in load balancers. Configure the threshold for
+  panic mode to start using `withLoadBalancer.panicMode`. ``PHAB_ID=D879034``
+
+* finagle-core: Provide `ServerParamsInjector`, a class that will be service-loaded at run-time
+  by Finagle servers, and will allow generic configuration of all sets of parameters.
+  ``PHAB_ID=D897484``
+
+* finagle-memcached: Add new function, `newLoadBalancedTwemcacheClient`, to create a TwemcacheClient
+  that doesn't use a partitioning service.
+  ``PHAB_ID=D911789`
+
+Bug Fixes
+~~~~~~~~~
+* finagle-core: fix issue where `Trace.traceLocal` and `Trace.traceLocalFuture` nested traces mistakenly
+  annotate to the parent span. ``PHAB_ID=D912760``
+
+Breaking API Changes
+~~~~~~~~~~~~~~~~~~~~
+
+* finagle-core: Remove unused `DeterministicAperture` along with pathways to use weight-unaware 
+  aperture loadbalancers. ``PHAB_ID=D933405``
 
 * finagle-base-http: Methods for getting/setting `Accept`, `Authorization`, `Host`, `Referer`,
   `User-Agent`, `X-Forwarded-For` headers were moved from `c.t.f.http.Message` class to
@@ -24,6 +107,18 @@ Breaking API Changes
 
 * finagle-core: Update OffloadFilter.Param API to encourage recommended construction.
   ``PHAB_ID=D882210``
+
+* finagle-core: `Trace.recordLocalSpan` is `private[this]` and no longer `protected`. ``PHAB_ID=D912760``
+
+* finagle-core: "ServiceFactory#status" is abstract and requires implementation in the inherited
+  classes. ``PHAB_ID=D933288``
+
+* finagle-core: `StackTransformer` has been renamed to `ServerStackTransformer` and the symmetric
+  client equivalent (`ClientStackTransformer`) has been added. For those using the older `StackTransformer`
+  API you will both need to change the code (fix the extends) __and__ rename the META-INF file from
+  `resources/META-INF/services/com.twitter.finagle.StackTransformer` to
+  `resources/META-INF/services/com.twitter.finagle.ServerStackTransformer` in order to have your
+  transformer continue to service-load correctly. ``PHAB_ID=D937634``
 
 Runtime Behavior Changes
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -38,6 +133,14 @@ request to multiple partitions. ``PHAB_ID=D882370``
   `loadbalancer/panicked`. ``PHAB_ID=D881529``
 
 * finagle: Upgrade to Netty 4.1.76.Final and netty-tcnative 2.0.51.Final. ``PHAB_ID=D886019``
+
+* finagle: Update Jackson library to version 2.13.3 ``PHAB_ID=D906005``
+
+* finagle: Bump version of lz4-java to 1.8.0. ``PHAB_ID=D905411``
+
+* finagle: Upgrade to Netty 4.1.78.Final and netty-tcnative 2.0.53.Final to support
+  tls tracing for finagle in [Pixie](https://pixie.dev/). The Pixie changes aren't
+  complete yet, but upgrading netty is a prerequisite for that. ``PHAB_ID=D916996```
 
 22.4.0
 ------

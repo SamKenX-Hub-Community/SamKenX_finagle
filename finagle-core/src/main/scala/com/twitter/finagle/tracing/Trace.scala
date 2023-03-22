@@ -3,6 +3,7 @@ package com.twitter.finagle.tracing
 import com.twitter.app.GlobalFlag
 import com.twitter.finagle.context.Contexts
 import com.twitter.io.Buf
+import com.twitter.util.Future
 import com.twitter.util.Try
 
 object traceId128Bit
@@ -52,6 +53,12 @@ object Trace extends Tracing {
         TraceId.deserialize(Buf.ByteArray.Owned.extract(body))
     }
 
+  @deprecated("Please use Tracing.LocalBeginAnnotation directly", "2022-06-09")
+  def LocalBeginAnnotation: String = Tracing.LocalBeginAnnotation
+
+  @deprecated("Please use Tracing.LocalEndAnnotation directly", "2022-06-09")
+  def LocalEndAnnotation: String = Tracing.LocalEndAnnotation
+
   // It's ok to either write or read this value without synchronizing as long as we're not
   // doing read-modify-write concurrently (which we don't).
   @volatile private var _enabled = com.twitter.finagle.tracing.enabled()
@@ -95,12 +102,31 @@ object Trace extends Tracing {
    * @param terminal true if traceId is a terminal id. Future calls to set() after a terminal
    *                 id is set will not set the traceId
    */
-  def letId[R](traceId: TraceId, terminal: Boolean = false)(f: => R): R =
+  def letId[R](traceId: TraceId, terminal: Boolean = false)(f: => R): R = {
     if (isTerminal) f
     else {
       val tid = if (terminal) traceId.copy(terminal = terminal) else traceId
       Contexts.broadcast.let(TraceIdContext, tid)(f)
     }
+  }
+
+  /**
+   * A version of [com.twitter.finagle.tracing.Trace.letId] that also tracks the given
+   * traceId in any TracerProxy in tracers' traceId buffer.
+   */
+  private[finagle] def letPeerId[R](
+    tracers: Seq[Tracer] = tracers,
+    terminal: Boolean = false
+  )(
+    f: => R
+  ): R = {
+    val traceId = peerId
+    tracers.foreach {
+      case t: FanoutTracer => t.flushRecordsToNewId(traceId)
+      case _ => //do nothing
+    }
+    letId[R](traceId, terminal)(f)
+  }
 
   /**
    * A version of [com.twitter.finagle.tracing.Trace.letId] providing an
@@ -173,9 +199,14 @@ object Trace extends Tracing {
 
           oldId.copy(_sampled = sampledOption)
       }
+      val tracerSR: Float = tracer.getSampleRate
+      val idFlags: Flags = newId.flags
+      val newIdWithSR =
+        if (idFlags.getSampleRate() != tracerSR) newId.copy(flags = idFlags.setSampleRate(tracerSR))
+        else newId
 
       val ts = tracers
-      if (ts.contains(tracer)) Contexts.broadcast.let(TraceIdContext, newId)(f)
+      if (ts.contains(tracer)) Contexts.broadcast.let(TraceIdContext, newIdWithSR)(f)
       else {
         Contexts.local.let(tracersCtx, tracer +: ts) {
           Contexts.broadcast.let(TraceIdContext, newId)(f)
@@ -194,4 +225,59 @@ object Trace extends Tracing {
         f
       }
     }
+
+  /**
+   * Unlike normal tracers, a FanoutTracer functions only as the sole tracer in tracersCtx. This
+   * is because FanoutTracer relies on the ability to postpone flushing of a record until we can
+   * replace its traceId with that of a peer trace. If another [Tracer] is present, it will immediately
+   * flush the record on the wrong TraceId, leaving us with malformed traces.
+   *
+   * These Fanout analogs of the above methods ensure that the FanoutTracer is the only Tracer
+   * in tracersCtx when it is added.
+   *
+   * */
+  final private[finagle] def letFanoutTracer[R](
+    tracer: FanoutTracer
+  )(
+    f: => Future[R]
+  ): Future[R] = {
+    val fts = wrapAllTracers()
+    val ret: Future[R] =
+      if (fts.contains(tracer)) Contexts.local.let(tracersCtx, fts)(f)
+      else Contexts.local.let(tracersCtx, tracer +: fts)(f)
+    ret.ensure(fts.foreach(_.flush()))
+  }
+
+  final private[finagle] def letFanoutTracerAndNextId[R](
+    tracer: FanoutTracer,
+    terminal: Boolean = false
+  )(
+    f: => Future[R]
+  ): Future[R] = {
+    val tid = if (terminal) nextId.copy(terminal = terminal) else nextId
+    letFanoutTracerAndId(tracer, tid)(f)
+  }
+
+  final private[finagle] def letFanoutTracerAndId[R](
+    tracer: FanoutTracer,
+    traceId: TraceId,
+    terminal: Boolean = false
+  )(
+    f: => Future[R]
+  ): Future[R] = {
+    val fts = wrapAllTracers()
+    Contexts.local
+      .let(tracersCtx, fts) {
+        letTracerAndId(tracer, traceId, terminal)(f)
+      }.ensure(fts.foreach(_.flush()))
+  }
+
+  private[this] def wrapAllTracers(): Seq[FanoutTracer] = {
+    val ts = tracers
+    ts.map {
+      case ft: FanoutTracer => ft
+      case t => FanoutTracer(t)
+    }
+  }
+
 }

@@ -6,7 +6,7 @@ import com.twitter.finagle.filter._
 import com.twitter.finagle.param._
 import com.twitter.finagle.service.DeadlineFilter
 import com.twitter.finagle.service.ExpiringService
-import com.twitter.finagle.service.MetricBuilderRegistry
+import com.twitter.finagle.service.CoreMetricsRegistry
 import com.twitter.finagle.service.StatsFilter
 import com.twitter.finagle.service.TimeoutFilter
 import com.twitter.finagle.stats.ServerStatsReceiver
@@ -130,7 +130,7 @@ object StackServer {
     // TimeoutFilter, the deadline will start from the current time, and
     // therefore not be expired if the request were to then pass through
     // DeadlineFilter. Thus, DeadlineFilter is pushed after TimeoutFilter.
-    stk.push(DeadlineFilter.module)
+    stk.push(DeadlineFilter.serverModule)
     stk.push(DtabStatsFilter.module)
     // Admission Control filters are inserted before `StatsFilter` so that rejected
     // requests are counted. We may need to adjust how latency are recorded
@@ -160,6 +160,9 @@ object StackServer {
     // This module is placed at the top of the stack and shifts Future execution context
     // from IO threads into a configured FuturePool right after Netty.
     stk.push(OffloadFilter.server)
+    // Fork requests into a new Fiber early in the stack so all work by subsequent
+    // modules goes through Fiber submission.
+    stk.push(FiberForkFilter.module)
     // The StatsFilter needs to be above the OffloadFilter so that we can
     // calculate latency metric changes when there's an offload delay.
     stk.push(StatsFilter.module)
@@ -168,7 +171,7 @@ object StackServer {
     // The TraceInitializerFilter must be pushed after most other modules so that
     // any Tracing produced by those modules is enclosed in the appropriate
     // span.
-    stk.push(TraceInitializerFilter.serverModule)
+    stk.push(TraceInitializerFilter.serverModule())
     stk.push(MonitorFilter.serverModule)
 
     stk.result
@@ -176,17 +179,23 @@ object StackServer {
 
   /**
    * The default params used for StackServers.
-   * @note The MetricBuilderRegistry is stateful for each stack,
+   * @note The `CoreMetricsRegistry` is stateful for each stack,
    *       this should be evaluated every time calling,
    */
   def defaultParams: Stack.Params =
     Stack.Params.empty + Stats(ServerStatsReceiver) +
-      MetricBuilders(Some(new MetricBuilderRegistry()))
+      MetricBuilders(Some(new CoreMetricsRegistry()))
 
   /**
    * A set of StackTransformers for transforming server stacks.
    */
-  private[finagle] object DefaultTransformer extends StackTransformerCollection
+  private[finagle] object DefaultTransformer
+      extends StackTransformerCollection[ServerStackTransformer]
+
+  /**
+   * A set of ServerParamsInjectors for transforming server params.
+   */
+  private[finagle] object DefaultInjectors extends ParamsInjectorCollection[ServerParamsInjector]
 }
 
 /**

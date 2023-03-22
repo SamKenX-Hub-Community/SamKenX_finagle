@@ -256,6 +256,7 @@ abstract class AbstractStackClientTest
         })
 
       def close(deadline: Time) = Future.Done
+      def status: Status = Status.Open
     }
 
     val stack = StackClient
@@ -300,6 +301,7 @@ abstract class AbstractStackClientTest
         })
 
       def close(deadline: Time) = Future.Done
+      def status: Status = Status.Open
     }
 
     val stack = StackClient
@@ -419,6 +421,7 @@ abstract class AbstractStackClientTest
         Failure.rejected("unable to establish session")
       )
       def close(deadline: Time) = Future.Done
+      def status: Status = Status.Open
     }
 
     intercept[Failure] { await(cl()) }
@@ -432,6 +435,7 @@ abstract class AbstractStackClientTest
         Failure("don't restart this!")
       )
       def close(deadline: Time) = Future.Done
+      def status: Status = Status.Open
     }
 
     intercept[Failure] { await(cl()) }
@@ -474,6 +478,7 @@ abstract class AbstractStackClientTest
 
       def apply(conn: ClientConnection): Future[Service[Unit, Unit]] = Future.value(service)
       def close(deadline: Time): Future[Unit] = Future.Done
+      def status: Status = service.status
     }
 
     val fac1 = new CountFactory
@@ -607,7 +612,7 @@ abstract class AbstractStackClientTest
 
   test("pending request limit is per connection") {
     class CountingService(p: Promise[Unit]) extends Service[Unit, Unit] {
-      var pending = new AtomicInteger()
+      val pending = new AtomicInteger()
       val satisfied = new AtomicInteger()
       def apply(req: Unit): Future[Unit] = {
         pending.incrementAndGet()
@@ -635,6 +640,7 @@ abstract class AbstractStackClientTest
               }
 
             def close(deadline: Time): Future[Unit] = Future.Done
+            def status: Status = Status.worst(endpoint1.status, endpoint2.status)
           }
         )
       )
@@ -668,6 +674,7 @@ abstract class AbstractStackClientTest
     val e1rejected = intercept[Failure] { await(e1r3) }
 
     val session2 = await(svcFac())
+
     // pending
     val e2r1 = session2(())
     // pending
@@ -693,6 +700,10 @@ abstract class AbstractStackClientTest
     p2.setDone()
     assert(endpoint1.satisfied.get() == 2)
     assert(endpoint2.satisfied.get() == 2)
+
+    // Make sure they're finished before proceeding.
+    await(e2r1)
+    await(e2r2)
 
     // subsequent requests aren't filtered
     val e2r4 = session2(())
@@ -759,7 +770,10 @@ abstract class AbstractStackClientTest
       await(svc("hello"))
     }
 
-    assert(failure.toString == "Failure(boom!, flags=0x00) with Service -> stringClient")
+    // appId varies with local test
+    assert(
+      failure.toString.contains(
+        "Failure(boom!, flags=0x00) with Service -> stringClient with AppId -> "))
   }
 
   test("Injects the appropriate params") {
@@ -800,12 +814,15 @@ abstract class AbstractStackClientTest
 
   test("DefaultTransformers") {
     val exc = new Exception("DefaultTransformer.boom!")
-    val defaultElem = new StackTransformer {
+    val defaultElem = new ClientStackTransformer {
       def name = "prepend-nop-module"
+
       def apply[Req, Rep](stack: Stack[ServiceFactory[Req, Rep]]): Stack[ServiceFactory[Req, Rep]] =
         stack.prepend(new Stack.Module0[ServiceFactory[Req, Rep]] {
           def role = Stack.Role("defaulttransformers-module")
+
           def description = "a stack module added via global DefaultTransformers"
+
           def make(next: ServiceFactory[Req, Rep]): ServiceFactory[Req, Rep] = {
             val filter = new SimpleFilter[Req, Rep] {
               def apply(req: Req, svc: Service[Req, Rep]): Future[Rep] = {
@@ -822,7 +839,9 @@ abstract class AbstractStackClientTest
         .serve(":*", Service.mk[String, String](Future.value))
       val boundAddress = listeningServer.boundAddress.asInstanceOf[InetSocketAddress]
       val svc = baseClient.newService(Name.bound(Address(boundAddress)), "stringClient")
-      assert(exc == (intercept[Exception] { await(svc("hello")) }))
+      assert(exc == (intercept[Exception] {
+        await(svc("hello"))
+      }))
     } finally {
       StackClient.DefaultTransformer.clear()
     }

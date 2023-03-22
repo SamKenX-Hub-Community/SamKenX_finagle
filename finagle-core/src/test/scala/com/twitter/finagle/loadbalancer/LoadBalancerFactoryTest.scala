@@ -390,159 +390,80 @@ class LoadBalancerFactoryTest extends AnyFunSuite with Eventually with Integrati
       def zone: Option[String] = Some("smf1")
     }
     ServerInfo.initialize(serverInfo)
-    com.twitter.finagle.toggle.flag.overrides
-      .let("com.twitter.finagle.loadbalancer.WeightedAperture.v2", 1.0) {
-
-        val endpoint: Stack[ServiceFactory[String, String]] =
-          Stack.leaf(
-            Stack.Role("endpoint"),
-            ServiceFactory.const[String, String](Service.mk[String, String](req => ???))
-          )
-
-        val mockBalancer = new LoadBalancerFactory {
-          override def supportsWeighted: Boolean = true
-
-          def newBalancer[Req, Rep](
-            endpoints: Activity[IndexedSeq[EndpointFactory[Req, Rep]]],
-            emptyException: NoBrokersAvailableException,
-            params: Stack.Params
-          ): ServiceFactory[Req, Rep] = {
-            ServiceFactory.const(Service.mk(_ => ???))
-          }
-        }
-
-        val stack = LoadBalancerFactory.module[String, String].toStack(endpoint)
-
-        val params = Stack.Params.empty +
-          LoadBalancerFactory.Param(mockBalancer) +
-          LoadBalancerFactory.ManageWeights(true)
-
-        val a: ServiceFactory[String, String] = stack.make(params)
-
-        assert(!a.isInstanceOf[TrafficDistributor[String, String]])
-      }
-  }
-
-  test("WeightedAperture has weights available to it from address metadata") {
-    com.twitter.finagle.toggle.flag.overrides
-      .let("com.twitter.finagle.loadbalancer.WeightedAperture.v2", 1.0) {
-
-        val endpoint: Stack[ServiceFactory[String, String]] =
-          Stack.leaf(
-            Stack.Role("endpoint"),
-            ServiceFactory.const[String, String](Service.mk[String, String](req => ???))
-          )
-
-        val futureWeights = Promise[Set[Double]]()
-        val mockBalancer = new LoadBalancerFactory {
-          override def supportsWeighted: Boolean = true
-
-          def newBalancer[Req, Rep](
-            endpoints: Activity[IndexedSeq[EndpointFactory[Req, Rep]]],
-            emptyException: NoBrokersAvailableException,
-            params: Stack.Params
-          ): ServiceFactory[Req, Rep] = {
-            futureWeights.setValue(endpoints.sample().toSet.map { ep: EndpointFactory[_, _] =>
-              ep.weight
-            })
-            ServiceFactory.const(Service.mk(_ => ???))
-          }
-        }
-
-        val stack = LoadBalancerFactory.module[String, String].toStack(endpoint)
-
-        val addresses = Set(
-          WeightedAddress(Address.Inet(new InetSocketAddress(5435), Map.empty), 2.0),
-          Address.Inet(new InetSocketAddress(5434), Map.empty)
-        )
-
-        val params = Stack.Params.empty +
-          LoadBalancerFactory.Dest(Var(Addr.Bound(addresses))) +
-          LoadBalancerFactory.Param(mockBalancer) +
-          LoadBalancerFactory.ManageWeights(true)
-
-        val a: ServiceFactory[String, String] = stack.make(params)
-
-        assert(!a.isInstanceOf[TrafficDistributor[String, String]])
-
-        val weights = await(futureWeights)
-        assert(weights == Set(1.0, 2.0))
-      }
-  }
-
-  test("can override WeightedApertureToggle with UseWeightedBalancers Stack.Param") {
-    com.twitter.finagle.toggle.flag.overrides
-      .let("com.twitter.finagle.loadbalancer.WeightedAperture.v2", 0.0) {
-
-        val endpoint: Stack[ServiceFactory[String, String]] =
-          Stack.leaf(
-            Stack.Role("endpoint"),
-            ServiceFactory.const[String, String](Service.mk[String, String](req => ???))
-          )
-
-        val mockBalancer = new LoadBalancerFactory {
-          override def supportsWeighted: Boolean = true
-
-          def newBalancer[Req, Rep](
-            endpoints: Activity[IndexedSeq[EndpointFactory[Req, Rep]]],
-            emptyException: NoBrokersAvailableException,
-            params: Stack.Params
-          ): ServiceFactory[Req, Rep] = {
-            ServiceFactory.const(Service.mk(_ => ???))
-          }
-        }
-
-        val stack = LoadBalancerFactory.module[String, String].toStack(endpoint)
-
-        val params = Stack.Params.empty +
-          LoadBalancerFactory.Param(mockBalancer) +
-          LoadBalancerFactory.ManageWeights(true) +
-          LoadBalancerFactory.UseWeightedBalancers(true)
-
-        val a: ServiceFactory[String, String] = stack.make(params)
-
-        assert(!a.isInstanceOf[TrafficDistributor[String, String]])
-      }
-  }
-
-  test("Default panic mode is MajorityUnhealthy") {
     val endpoint: Stack[ServiceFactory[String, String]] =
       Stack.leaf(
         Stack.Role("endpoint"),
         ServiceFactory.const[String, String](Service.mk[String, String](req => ???))
       )
 
-    val stack = LoadBalancerFactory.module[String, String].toStack(endpoint)
-
-    var eps: Vector[String] = Vector.empty
     val mockBalancer = new LoadBalancerFactory {
+      override def supportsWeighted: Boolean = true
+
       def newBalancer[Req, Rep](
         endpoints: Activity[IndexedSeq[EndpointFactory[Req, Rep]]],
         emptyException: NoBrokersAvailableException,
         params: Stack.Params
       ): ServiceFactory[Req, Rep] = {
-        eps = endpoints.sample().toVector.map(_.address.toString)
-        assert(params[PanicMode].maxEffort == PanicMode.MajorityUnhealthy.maxEffort)
         ServiceFactory.const(Service.mk(_ => ???))
       }
     }
 
-    val addresses = (0 to 10).map { i =>
-      Address(InetSocketAddress.createUnresolved(s"inet-address-$i", 0))
-    }
+    val stack = LoadBalancerFactory.module[String, String].toStack(endpoint)
 
-    stack.make(
-      Stack.Params.empty +
-        LoadBalancerFactory.Param(mockBalancer) +
-        LoadBalancerFactory.Dest(Var(Addr.Bound(addresses.toSet)))
-    )
+    val params = Stack.Params.empty +
+      LoadBalancerFactory.Param(mockBalancer)
+
+    val a: ServiceFactory[String, String] = stack.make(params)
+
+    assert(!a.isInstanceOf[TrafficDistributor[String, String]])
   }
 
-  test("PanicModeToggle overrides stack param with FiftyPercentUnhealthy") {
+  test("WeightedAperture has weights available to it from address metadata") {
     val endpoint: Stack[ServiceFactory[String, String]] =
       Stack.leaf(
         Stack.Role("endpoint"),
         ServiceFactory.const[String, String](Service.mk[String, String](req => ???))
+      )
+
+    val futureWeights = Promise[Set[Double]]()
+    val mockBalancer = new LoadBalancerFactory {
+      override def supportsWeighted: Boolean = true
+
+      def newBalancer[Req, Rep](
+        endpoints: Activity[IndexedSeq[EndpointFactory[Req, Rep]]],
+        emptyException: NoBrokersAvailableException,
+        params: Stack.Params
+      ): ServiceFactory[Req, Rep] = {
+        futureWeights.setValue(endpoints.sample().toSet.map { ep: EndpointFactory[_, _] =>
+          ep.weight
+        })
+        ServiceFactory.const(Service.mk(_ => ???))
+      }
+    }
+
+    val stack = LoadBalancerFactory.module[String, String].toStack(endpoint)
+
+    val addresses = Set(
+      WeightedAddress(Address.Inet(new InetSocketAddress(5435), Map.empty), 2.0),
+      Address.Inet(new InetSocketAddress(5434), Map.empty)
+    )
+
+    val params = Stack.Params.empty +
+      LoadBalancerFactory.Dest(Var(Addr.Bound(addresses))) +
+      LoadBalancerFactory.Param(mockBalancer)
+
+    val a: ServiceFactory[String, String] = stack.make(params)
+
+    val weights = await(futureWeights)
+    assert(weights == Set(1.0, 2.0))
+
+  }
+
+  test("Default panic mode is FiftyPercentUnhealthy") {
+    val endpoint: Stack[ServiceFactory[String, String]] =
+      Stack.leaf(
+        Stack.Role("endpoint"),
+        ServiceFactory.const[String, String](Service.mk[String, String](_ => ???))
       )
 
     val stack = LoadBalancerFactory.module[String, String].toStack(endpoint)
@@ -564,14 +485,11 @@ class LoadBalancerFactoryTest extends AnyFunSuite with Eventually with Integrati
       Address(InetSocketAddress.createUnresolved(s"inet-address-$i", 0))
     }
 
-    com.twitter.finagle.toggle.flag.overrides
-      .let("com.twitter.finagle.loadbalancer.PanicMode", 1.0) {
-        stack.make(
-          Stack.Params.empty +
-            LoadBalancerFactory.Param(mockBalancer) +
-            LoadBalancerFactory.Dest(Var(Addr.Bound(addresses.toSet)))
-        )
-      }
+    stack.make(
+      Stack.Params.empty +
+        LoadBalancerFactory.Param(mockBalancer) +
+        LoadBalancerFactory.Dest(Var(Addr.Bound(addresses.toSet)))
+    )
 
   }
 }

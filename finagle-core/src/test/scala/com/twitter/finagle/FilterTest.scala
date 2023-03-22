@@ -1,11 +1,18 @@
 package com.twitter.finagle
 
 import com.twitter.conversions.DurationOps._
-import com.twitter.finagle.service.{ConstantService, NilService}
-import com.twitter.util.{Await, Future, Promise, Time}
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
-import org.mockito.Matchers._
-import org.mockito.Mockito.{never, spy, times, verify}
+import com.twitter.finagle.service.ConstantService
+import com.twitter.finagle.service.NilService
+import com.twitter.util.Await
+import com.twitter.util.Future
+import com.twitter.util.Promise
+import com.twitter.util.Time
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import org.mockito.ArgumentMatchers._
+import org.mockito.Mockito.never
+import org.mockito.Mockito.spy
+import org.mockito.Mockito.verify
 import org.scalatest.funsuite.AnyFunSuite
 
 class FilterTest extends AnyFunSuite {
@@ -13,6 +20,14 @@ class FilterTest extends AnyFunSuite {
 
   class PassThruFilter extends Filter[Int, Int, Int, Int] {
     def apply(req: Int, svc: Service[Int, Int]): Future[Int] = svc(req)
+  }
+
+  class PassThruAndModifyFilter extends Filter[Int, Int, Int, Int] {
+    def apply(req: Int, svc: Service[Int, Int]): Future[Int] = svc(req + 5)
+  }
+
+  class PassThruService extends Service[Int, Int] {
+    def apply(request: Int): Future[Int] = Future.value(request)
   }
 
   class PassThruTypeAgnosticFilter extends Filter.TypeAgnostic {
@@ -24,9 +39,11 @@ class FilterTest extends AnyFunSuite {
   class PassThruServiceFactory extends ServiceFactory[Int, Int] {
     def apply(conn: ClientConnection): Future[Service[Int, Int]] = Future.value(constSvc)
     def close(deadline: Time): Future[Unit] = Future.Done
+    def status: Status = Status.Open
   }
 
   val constSvc = new ConstantService[Int, Int](Future.value(2))
+  val passThruService = new PassThruService
   val constSvcFactory = ServiceFactory.const(constSvc)
 
   class FilterPlus1 extends Filter[Int, Int, Int, Int] {
@@ -87,10 +104,12 @@ class FilterTest extends AnyFunSuite {
   }
 
   test("Filter.andThen(Filter): applies next filter") {
-    val spied = spy(new PassThruFilter)
-    val svc = (new PassThruFilter).andThen(spied).andThen(constSvc)
-    await(svc(4))
-    verify(spied).apply(any[Int], any[Service[Int, Int]])
+    val changeFilter = new PassThruAndModifyFilter
+    val svc = (new PassThruFilter).andThen(changeFilter).andThen(passThruService)
+    val res = await(svc(4))
+    // PassThruFilter and PassThruService alone would return 4, but changeFilter will modify the
+    // request by adding 5 to it. We verify it was applied by confirming this change in behavior
+    assert(res == 9)
   }
 
   test("Filter.andThen: toString") {
@@ -380,24 +399,24 @@ class FilterTest extends AnyFunSuite {
   }
 
   test("Filter.andThenIf (tuple): applies next filter when true") {
-    val spied = spy(new PassThruFilter)
-    val svc = (new PassThruFilter).andThenIf((true, spied)).andThen(constSvc)
-    await(svc(4))
-    verify(spied).apply(any[Int], any[Service[Int, Int]])
+    val changeFilter = new PassThruAndModifyFilter
+    val svc = (new PassThruFilter).andThenIf((true, changeFilter)).andThen(passThruService)
+    val res = await(svc(4))
+    assert(res == 9)
   }
 
   test("Filter.andThenIf (tuple): doesn't apply next filter when false") {
-    val spied = spy(new PassThruFilter)
-    val svc = (new PassThruFilter).andThenIf((false, spied)).andThen(constSvc)
-    await(svc(4))
-    verify(spied, never).apply(any[Int], any[Service[Int, Int]])
+    val changeFilter = new PassThruAndModifyFilter
+    val svc = (new PassThruFilter).andThenIf((false, changeFilter)).andThen(passThruService)
+    val res = await(svc(4))
+    assert(res == 4)
   }
 
   test("Filter.andThenIf (params): applies next filter when true") {
-    val spied = spy(new PassThruFilter)
-    val svc = (new PassThruFilter).andThenIf(true, spied).andThen(constSvc)
-    await(svc(4))
-    verify(spied).apply(any[Int], any[Service[Int, Int]])
+    val changeFilter = new PassThruAndModifyFilter
+    val svc = (new PassThruFilter).andThenIf(true, changeFilter).andThen(passThruService)
+    val res = await(svc(4))
+    assert(res == 9)
   }
 
   test("Filter.andThenIf (params): doesn't apply next filter when false") {
@@ -408,18 +427,16 @@ class FilterTest extends AnyFunSuite {
   }
 
   test("Filter.choose: apply the underlying filter to certain requests") {
-    val spied = spy(new PassThruFilter)
+    val changeFilter = new PassThruAndModifyFilter
     val svc = Filter
       .choose[Int, Int] {
-        case req if req > 0 => spied
+        case req if req > 0 => changeFilter
       }
-      .andThen(constSvc)
+      .andThen(passThruService)
 
-    assert(await(svc(100)) == 2)
-    verify(spied, times(1)).apply(any[Int], any[Service[Int, Int]])
+    assert(await(svc(100)) == 105)
 
-    assert(await(svc(-99)) == 2)
-    verify(spied, times(1)).apply(any[Int], any[Service[Int, Int]])
+    assert(await(svc(-99)) == -99)
   }
 
   test("Filter.TypeAgnostic.Identity.andThen(Filter.TypeAgnostic): applies next filter") {

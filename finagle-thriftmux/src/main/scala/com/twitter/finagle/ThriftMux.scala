@@ -1,6 +1,7 @@
 package com.twitter.finagle
 
 import com.twitter.finagle.client.ClientRegistry
+import com.twitter.finagle.client.DynamicBackupRequestFilter
 import com.twitter.finagle.client.ExceptionRemoteInfoFactory
 import com.twitter.finagle.client.StackBasedClient
 import com.twitter.finagle.client.StackClient
@@ -27,6 +28,7 @@ import com.twitter.finagle.ssl.OpportunisticTls
 import com.twitter.finagle.stats.ClientStatsReceiver
 import com.twitter.finagle.stats.ExceptionStatsHandler
 import com.twitter.finagle.stats.ServerStatsReceiver
+import com.twitter.finagle.stats.SourceRole
 import com.twitter.finagle.stats.StandardStatsReceiver
 import com.twitter.finagle.stats.StatsReceiver
 import com.twitter.finagle.thrift._
@@ -149,6 +151,10 @@ object ThriftMux
         ExceptionTracingFilter.role,
         ExceptionTracingFilter.module(new thriftmux.service.ClientExceptionTracingFilter))
       .insertAfter(BindingFactory.role, ThriftPartitioningService.module(ThriftMuxMarshallable))
+      // BackupRequestFilter comes after Partitioning so that physical requests are backed up across a fanout
+      .insertAfter(
+        ThriftPartitioningService.role,
+        DynamicBackupRequestFilter.placeholder[mux.Request, mux.Response])
   }
 
   /**
@@ -340,7 +346,8 @@ object ThriftMux
         // We set ClientId a bit early, because ThriftMux relies on that broadcast
         // context to be set when dispatching.
         ExceptionRemoteInfoFactory.letUpstream(Upstream.addr, ClientId.current.map(_.name)) {
-          ClientId.let(clientId) {
+          val finalClientId = ClientId.overridden.orElse(clientId)
+          ClientId.let(finalClientId) {
             val requestCtx = Contexts.local.getOrElse(Headers.Request.Key, EmptyRequestHeadersFn)
             // TODO set the Path here.
             val muxRequest =
@@ -712,7 +719,7 @@ object ThriftMux
       .configured(
         StandardStats(
           stats.StatsAndClassifier(
-            StandardStatsReceiver(stats.Server, protocolLibraryName),
+            new StandardStatsReceiver(SourceRole.Server, protocolLibraryName),
             ThriftMuxResponseClassifier.ThriftExceptionsAsFailures
           )))
 

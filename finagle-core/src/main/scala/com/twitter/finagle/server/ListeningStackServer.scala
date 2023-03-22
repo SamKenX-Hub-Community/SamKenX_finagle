@@ -3,15 +3,20 @@ package com.twitter.finagle.server
 import com.twitter.finagle.Stack.Param
 import com.twitter.finagle.filter.RequestLogger
 import com.twitter.finagle.param._
-import com.twitter.finagle.{ClientConnection, ListeningServer, ServiceFactory, Stack}
+import com.twitter.finagle.ClientConnection
+import com.twitter.finagle.ListeningServer
+import com.twitter.finagle.ServiceFactory
+import com.twitter.finagle.Stack
+import com.twitter.finagle.server.ListeningStackServer.DimensionalServerScopes
 import com.twitter.finagle.stack.Endpoint
-import com.twitter.finagle.stats.{
-  RelativeNameMarkingStatsReceiver,
-  RoleConfiguredStatsReceiver,
-  Server
-}
+import com.twitter.finagle.stats.RelativeNameMarkingStatsReceiver
+import com.twitter.finagle.stats.RoleConfiguredStatsReceiver
+import com.twitter.finagle.stats.RootFinagleStatsReceiver
+import com.twitter.finagle.stats.SourceRole
 import com.twitter.util.registry.GlobalRegistry
-import com.twitter.util.{CloseAwaitably, Future, Time}
+import com.twitter.util.CloseAwaitably
+import com.twitter.util.Future
+import com.twitter.util.Time
 import java.net.SocketAddress
 
 /**
@@ -58,17 +63,23 @@ trait ListeningStackServer[Req, Rep, This <: ListeningStackServer[Req, Rep, This
       private[this] val serverLabel = ServerRegistry.nameOf(addr).getOrElse(label)
 
       private[this] val statsReceiver =
-        if (serverLabel.isEmpty) RoleConfiguredStatsReceiver(stats, Server)
+        if (serverLabel.isEmpty) RoleConfiguredStatsReceiver(stats, SourceRole.Server)
         else
           RoleConfiguredStatsReceiver(
-            RelativeNameMarkingStatsReceiver(stats.scope(serverLabel)),
-            Server,
+            RelativeNameMarkingStatsReceiver(
+              new RootFinagleStatsReceiver(stats, serverLabel, DimensionalServerScopes)
+            ),
+            SourceRole.Server,
             Some(serverLabel))
 
-      private[this] val serverParams = params +
-        Label(serverLabel) +
-        Stats(statsReceiver) +
-        Monitor(reporter(label, None).andThen(monitor))
+      private[this] val serverParams = StackServer.DefaultInjectors.injectors.foldLeft(
+        params +
+          Label(serverLabel) +
+          Stats(statsReceiver) +
+          Monitor(reporter(label, None).andThen(monitor))) {
+        case (prms, injector) =>
+          injector(prms)
+      }
 
       // We re-parameterize in case `newListeningServer` needs to access the
       // finalized parameters.
@@ -203,4 +214,8 @@ trait ListeningStackServer[Req, Rep, This <: ListeningStackServer[Req, Rep, This
     )
     GlobalRegistry.get.put(listenerImplKey, listenerName)
   }
+}
+
+private object ListeningStackServer {
+  private val DimensionalServerScopes: Seq[String] = Seq("rpc", "finagle", "server")
 }

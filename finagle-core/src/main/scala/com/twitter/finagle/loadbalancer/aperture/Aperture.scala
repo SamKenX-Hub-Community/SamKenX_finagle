@@ -3,6 +3,7 @@ package com.twitter.finagle.loadbalancer.aperture
 import com.twitter.finagle.Address.Inet
 import com.twitter.finagle._
 import com.twitter.finagle.loadbalancer.Balancer
+import com.twitter.finagle.stats.StatsReceiver
 import com.twitter.finagle.util.Rng
 import com.twitter.logging.Logger
 import com.twitter.util.Closable
@@ -58,16 +59,16 @@ private[loadbalancer] trait Aperture[Req, Rep] extends Balancer[Req, Rep] { self
   private[aperture] def rng: Rng
 
   /**
+   * The `statsReceiver` passed in to the `Balancer`.
+   */
+  private[aperture] def balancerStatsReceiver: StatsReceiver = self.statsReceiver
+
+  /**
    * The minimum aperture as specified by the user config. Note this value is advisory
    * and the distributor may actually derive a new min based on this.  See `minUnits`
    * for more details.
    */
   private[aperture] def minAperture: Int
-
-  /**
-   * Enables [[Aperture]] to create weight-aware balancers
-   */
-  private[aperture] def manageWeights: Boolean
 
   /**
    * Enables [[Aperture]] to read coordinate data from [[ProcessCoordinate]]
@@ -144,9 +145,6 @@ private[loadbalancer] trait Aperture[Req, Rep] extends Balancer[Req, Rep] { self
     statsReceiver.addGauge("use_deterministic_ordering") {
       if (dapertureActive) 1f else 0f
     },
-    statsReceiver.addGauge("eager_connections") {
-      if (eagerConnections) 1f else 0f
-    },
     statsReceiver.addGauge("vector_hash") { _vectorHash }
   )
 
@@ -178,7 +176,8 @@ private[loadbalancer] trait Aperture[Req, Rep] extends Balancer[Req, Rep] { self
       "physical_aperture_size" -> dist.physicalAperture,
       "min_aperture_size" -> dist.min,
       "max_aperture_size" -> dist.max,
-      "vector_hash" -> vectorHash
+      "vector_hash" -> vectorHash,
+      "eager_connections" -> eagerConnections
     ) ++ dist.additionalMetadata
   }
 
@@ -187,21 +186,7 @@ private[loadbalancer] trait Aperture[Req, Rep] extends Balancer[Req, Rep] { self
     initAperture: Int,
     coord: Coord
   ): BaseDist[Req, Rep, Node] = {
-    if (manageWeights) {
-      new WeightedAperture[Req, Rep, Node](
-        this,
-        vector,
-        initAperture,
-        coord
-      )
-    } else {
-      new DeterministicAperture[Req, Rep, Node](
-        this,
-        vector,
-        initAperture,
-        coord
-      )
-    }
+    new WeightedAperture[Req, Rep, Node](this, vector, initAperture, coord)
   }
 
   private[aperture] def mkRandomAperture(
@@ -225,9 +210,7 @@ private[loadbalancer] trait Aperture[Req, Rep] extends Balancer[Req, Rep] { self
 
   override def close(deadline: Time): Future[Unit] = {
     gauges.foreach(_.remove())
-    // If manageWeights is true, the Balancer is not wrapped in a TrafficDistributor and therefore
-    // needs to manage its own lifecycle.
-    val closeNodes = if (!manageWeights) Closable.nop else Closable.all(dist.vector: _*)
+    val closeNodes = Closable.all(dist.vector: _*)
     coordObservation
       .close(deadline)
       .before { closeNodes.close(deadline) }

@@ -5,7 +5,7 @@ import com.twitter.finagle._
 import com.twitter.finagle.http.Request
 import com.twitter.finagle.http.Response
 import com.twitter.finagle.integration.thriftscala.Echo
-import com.twitter.finagle.service.MetricBuilderRegistry.ExpressionNames.deadlineRejectName
+import com.twitter.finagle.service.CoreMetricsRegistry.ExpressionNames.deadlineRejectName
 import com.twitter.finagle.stats.InMemoryStatsReceiver
 import com.twitter.finagle.stats.exp.ExpressionNames
 import com.twitter.util.Await
@@ -72,8 +72,9 @@ class MetricsExpressionTest extends AnyFunSuite with BeforeAndAfter {
         .build[Echo.MethodPerEndpoint](getAddress(thriftServer2), "client3")
         .echo("hi"))
 
-    // all expressions are created
-    assert(statsReceivers.forall { sr =>
+    // all expressions are created for thrift/thriftmux servers
+    // no deadline expressions for http2 server
+    assert(statsReceivers.dropRight(1).forall { sr =>
       sr.expressions.size == 5 &&
       sr.expressions.mapValues(_.name).values.toSet == keySet
     })

@@ -15,11 +15,14 @@ import com.twitter.finagle.netty4.http.Netty4HttpListener
 import com.twitter.finagle.netty4.http.Netty4ServerStreamTransport
 import com.twitter.finagle.param.StandardStats
 import com.twitter.finagle.server._
+import com.twitter.finagle.service.DeadlineFilter
 import com.twitter.finagle.service.TimeoutFilter.PreferDeadlineOverTimeout
 import com.twitter.finagle.service.ResponseClassifier
 import com.twitter.finagle.service.RetryBudget
 import com.twitter.finagle.ssl.ApplicationProtocols
+import com.twitter.finagle.ssl.SnoopingLevelInterpreter
 import com.twitter.finagle.stats.ExceptionStatsHandler
+import com.twitter.finagle.stats.SourceRole
 import com.twitter.finagle.stats.StandardStatsReceiver
 import com.twitter.finagle.stats.StatsReceiver
 import com.twitter.finagle.tracing._
@@ -62,41 +65,36 @@ object Http extends Client[Request, Response] with HttpRichClient with Server[Re
    * @param serverTransport server [[StreamTransport]] factory
    * @param listener [[Listener]] factory
    */
-  final class HttpImpl private (
+  private[finagle] final class HttpImpl private (
     private[finagle] val clientEndpointer: Stackable[ServiceFactory[Request, Response]],
     private[finagle] val serverTransport: Transport[Any, Any] => StreamTransport[Response, Request],
-    private[finagle] val listener: Stack.Params => Listener[Any, Any, TransportContext],
-    private[finagle] val implName: String) {
+    private[finagle] val listener: Stack.Params => Listener[Any, Any, TransportContext])
 
-    def mk(): (HttpImpl, Stack.Param[HttpImpl]) = (this, HttpImpl.httpImplParam)
-  }
+  private[finagle] object HttpImpl {
+    implicit val httpImplParam: Stack.Param[HttpImpl] = Stack.Param(Http11Impl)
 
-  object HttpImpl {
-    implicit val httpImplParam: Stack.Param[HttpImpl] = Stack.Param(Netty4Impl)
-
-    val Netty4Impl: Http.HttpImpl = new Http.HttpImpl(
+    val Http11Impl: Http.HttpImpl = new Http.HttpImpl(
       ClientEndpointer.HttpEndpointer,
       new Netty4ServerStreamTransport(_),
-      Netty4HttpListener,
-      "Netty4"
+      Netty4HttpListener
     )
 
     val Http2Impl: Http.HttpImpl = new Http.HttpImpl(
       ClientEndpointer.Http2Endpointer,
       new Netty4ServerStreamTransport(_),
-      Http2Listener.apply _,
-      "Netty4"
+      Http2Listener.apply _
     )
   }
 
-  val Netty4Impl: Http.HttpImpl = HttpImpl.Netty4Impl
+  private val Http11Params: Stack.Params = Stack.Params.empty +
+    HttpImpl.Http11Impl +
+    com.twitter.finagle.param.ProtocolLibrary("http") +
+    com.twitter.finagle.netty4.ssl.Alpn(ApplicationProtocols.Supported(Seq("http/1.1")))
 
-  val Http2: Stack.Params = Stack.Params.empty +
+  private val Http2Params: Stack.Params = Stack.Params.empty +
     HttpImpl.Http2Impl +
     com.twitter.finagle.param.ProtocolLibrary("http/2") +
     com.twitter.finagle.netty4.ssl.Alpn(ApplicationProtocols.Supported(Seq("h2", "http/1.1")))
-
-  private val protocolLibrary = com.twitter.finagle.param.ProtocolLibrary("http")
 
   private[this] def treatServerErrorsAsFailures: Boolean = serverErrorsAsFailures()
 
@@ -162,7 +160,6 @@ object Http extends Client[Request, Response] with HttpRichClient with Server[Re
 
     private def params: Stack.Params =
       StackClient.defaultParams +
-        protocolLibrary +
         responseClassifierParam +
         PreferDeadlineOverTimeout(enabled = true)
   }
@@ -274,7 +271,7 @@ object Http extends Client[Request, Response] with HttpRichClient with Server[Re
      * @note this will override whatever has been set in the toggle.
      */
     def withHttp2: Client =
-      configuredParams(Http2)
+      configuredParams(Http2Params)
 
     /**
      * Disable HTTP/2
@@ -282,7 +279,7 @@ object Http extends Client[Request, Response] with HttpRichClient with Server[Re
      * @note this will override whatever has been set in the toggle.
      */
     def withNoHttp2: Client =
-      configured(HttpImpl.Netty4Impl)
+      configuredParams(Http11Params)
 
     /**
      * Enable kerberos client authentication for http requests
@@ -404,13 +401,15 @@ object Http extends Client[Request, Response] with HttpRichClient with Server[Re
         .insertAfter(
           ServerContextFilter.role,
           BackupRequest.traceAnnotationModule[Request, Response])
+        // The current DeadlineFilter won't work for Http2 server, remove it from Http server
+        // until it is fixed
+        .remove(DeadlineFilter.serverModule.role)
 
     private def params: Stack.Params = StackServer.defaultParams +
-      protocolLibrary +
       responseClassifierParam +
       StandardStats(
         stats.StatsAndClassifier(
-          StandardStatsReceiver(stats.Server, protocolLibrary.name),
+          new StandardStatsReceiver(SourceRole.Server, "http"),
           HttpResponseClassifier.ServerErrorsAsFailures)) +
       PreferDeadlineOverTimeout(enabled = true)
   }
@@ -533,7 +532,7 @@ object Http extends Client[Request, Response] with HttpRichClient with Server[Re
      * @note this will override whatever has been set in the toggle.
      */
     def withHttp2: Server =
-      configuredParams(Http2)
+      configuredParams(Http2Params)
 
     /**
      * Disable HTTP/2
@@ -541,7 +540,7 @@ object Http extends Client[Request, Response] with HttpRichClient with Server[Re
      * @note this will override whatever has been set in the toggle.
      */
     def withNoHttp2: Server =
-      configured(HttpImpl.Netty4Impl)
+      configuredParams(Http11Params)
 
     /**
      * Enable kerberos server authentication for http requests
@@ -560,12 +559,24 @@ object Http extends Client[Request, Response] with HttpRichClient with Server[Re
      * @note Servers operating as proxies should disable automatic responses in
      *       order to allow origin servers to determine whether the expectation
      *       can be met.
-     *
      * @note Disabling automatic continues is only supported in
-     *       [[com.twitter.finagle.Http.HttpImpl.Netty4Impl]] servers.
+     *       [[com.twitter.finagle.Http.HttpImpl.Http11Impl]] servers.
      */
     def withNoAutomaticContinue: Server =
       configured(http.param.AutomaticContinue(false))
+
+    /**
+     * When enabled simultaneously with TLS (`withTransport.tls`), this server would use
+     * both cleartext and TLS socket connections on the same port (default: `disabled`).
+     */
+    def withTlsSnooping: Server =
+      configured(SnoopingLevelInterpreter.EnabledForNonNegotiatingProtocols)
+
+    /**
+     * Disables TLS snooping for this server.
+     */
+    def withNoTlsSnooping: Server =
+      configured(SnoopingLevelInterpreter.Off)
 
     // Java-friendly forwarders
     // See https://issues.scala-lang.org/browse/SI-8905

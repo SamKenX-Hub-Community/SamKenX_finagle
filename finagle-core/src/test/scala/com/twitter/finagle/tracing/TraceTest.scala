@@ -8,10 +8,11 @@ import com.twitter.util.Await
 import com.twitter.util.Duration
 import com.twitter.util.Future
 import com.twitter.util.MockTimer
+import com.twitter.util.Promise
 import com.twitter.util.Return
 import com.twitter.util.Throw
 import com.twitter.util.Time
-import org.mockito.Matchers.any
+import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.atLeast
 import org.mockito.Mockito.never
 import org.mockito.Mockito.times
@@ -230,7 +231,7 @@ class TraceTest extends AnyFunSuite with MockitoSugar with BeforeAndAfter with O
   test("Trace.record: record binary annotations") {
     Time.withCurrentTimeFrozen { tc =>
       Trace.letTracerAndId(tracer1, id0) {
-        val rec1 = Record(id0, Time.now, Annotation.BinaryAnnotation("key", "test"))
+        val rec1 = Record(id0, Time.Bottom, Annotation.BinaryAnnotation("key", "test"))
         Trace.recordBinary("key", "test")
         verify(tracer1, times(1)).record(rec1)
       }
@@ -254,10 +255,10 @@ class TraceTest extends AnyFunSuite with MockitoSugar with BeforeAndAfter with O
           Trace.recordCallSite()
         }
         foo()
-        verify(tracer1, times(1)).record(Record(id0, Time.now, functionAnn))
-        verify(tracer1, times(1)).record(Record(id0, Time.now, namespaceAnn))
-        verify(tracer1, times(1)).record(Record(id0, Time.now, filePathAnn))
-        verify(tracer1, times(1)).record(Record(id0, Time.now, lineNoAnn))
+        verify(tracer1, times(1)).record(Record(id0, Time.Bottom, functionAnn))
+        verify(tracer1, times(1)).record(Record(id0, Time.Bottom, namespaceAnn))
+        verify(tracer1, times(1)).record(Record(id0, Time.Bottom, filePathAnn))
+        verify(tracer1, times(1)).record(Record(id0, Time.Bottom, lineNoAnn))
       }
     }
   }
@@ -325,6 +326,25 @@ class TraceTest extends AnyFunSuite with MockitoSugar with BeforeAndAfter with O
           assert(Trace.isTerminal == false)
           assert(Trace.tracers == List(tracer))
           verify(tracer, never()).sampleTrace(currentId)
+        }
+      }
+    }
+  }
+
+  test("Trace.letTracerAndId: propagate sampleRate") {
+    Time.withCurrentTimeFrozen { tc =>
+      val tracer = new Tracer {
+        def record(record: Record): Unit = ???
+        def sampleTrace(traceId: TraceId): Option[Boolean] = Some(true)
+        def getSampleRate: Float = 0.5f
+      }
+
+      val parentId =
+        TraceId(Some(SpanId(123)), Some(SpanId(456)), SpanId(789), Some(false), Flags(0))
+      Trace.letTracerAndId(tracer, parentId) {
+        Trace.letTracerAndNextId(tracer) {
+          val currentId = Trace.id
+          assert(currentId.flags.getSampleRate == tracer.getSampleRate)
         }
       }
     }
@@ -490,18 +510,184 @@ class TraceTest extends AnyFunSuite with MockitoSugar with BeforeAndAfter with O
           Trace.id
         }
 
-        assert(tracer.toSeq.contains(Record(childTraceId, startTime, Annotation.Rpc(name))))
+        val traces = tracer.toSeq
+
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.Rpc(name))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.ServiceName("local"))))
         assert(
-          tracer.toSeq.contains(Record(childTraceId, startTime, Annotation.ServiceName("local"))))
+          traces.contains(
+            Record(childTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", name))))
+        assert(traces.contains(Record(childTraceId, startTime, Annotation.Message("local/begin"))))
         assert(
-          tracer.toSeq.contains(
-            Record(childTraceId, startTime, Annotation.BinaryAnnotation("lc", name))))
-        assert(
-          tracer.toSeq.contains(Record(childTraceId, startTime, Annotation.Message("local/begin"))))
-        assert(
-          tracer.toSeq.contains(
+          traces.contains(
             Record(childTraceId, startTime.plus(1.second), Annotation.Message("local/end"))))
         assert(parentTraceId != childTraceId)
+      }
+    }
+  }
+
+  test("support nested local spans (static)") {
+    val startTime = Time.now
+    Time.withTimeAt(startTime) { ctrl =>
+      val tracer = new BufferingTracer()
+      val parentTraceId = Trace.id
+      val name = "work"
+
+      Trace.letTracerAndId(tracer, parentTraceId) {
+        val trace = Trace()
+        trace.recordRpc("outer")
+
+        var subChildTraceId: TraceId = parentTraceId
+        val childTraceId = Trace.traceLocal(name) {
+          subChildTraceId = Trace.traceLocal("sub") {
+            ctrl.advance(1.second)
+            Trace.id
+          }
+          ctrl.advance(1.second)
+
+          Trace.id
+        }
+
+        val traces = tracer.toSeq
+
+        assert(subChildTraceId != parentTraceId)
+        assert(traces.contains(Record(parentTraceId, Time.Bottom, Annotation.Rpc("outer"))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.Rpc(name))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.ServiceName("local"))))
+        assert(
+          traces.contains(
+            Record(childTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", name))))
+        assert(traces.contains(Record(childTraceId, startTime, Annotation.Message("local/begin"))))
+        assert(
+          traces.contains(
+            Record(childTraceId, startTime.plus(2.second), Annotation.Message("local/end"))))
+        assert(traces.contains(Record(subChildTraceId, Time.Bottom, Annotation.Rpc("sub"))))
+        assert(
+          traces.contains(Record(subChildTraceId, Time.Bottom, Annotation.ServiceName("local"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", "sub"))))
+        assert(
+          traces.contains(Record(subChildTraceId, startTime, Annotation.Message("local/begin"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, startTime.plus(1.second), Annotation.Message("local/end"))))
+        assert(parentTraceId != childTraceId)
+        assert(subChildTraceId.parentId == childTraceId.spanId)
+        assert(childTraceId.parentId == parentTraceId.spanId)
+        assert(subChildTraceId != childTraceId)
+      }
+    }
+  }
+
+  test("support nested local spans (member without new scope)") {
+    val startTime = Time.now
+    Time.withTimeAt(startTime) { ctrl =>
+      val tracer = new BufferingTracer()
+      val parentTraceId = Trace.id
+      val name = "work"
+
+      Trace.letTracerAndId(tracer, parentTraceId) {
+        val trace = Trace()
+        trace.recordRpc("outer")
+
+        var subChildTraceId: TraceId = parentTraceId
+        val childTraceId = trace.traceLocal(name) {
+          subChildTraceId = trace.traceLocal("sub") {
+            ctrl.advance(1.second)
+            Trace.id
+          }
+          ctrl.advance(1.second)
+
+          Trace.id
+        }
+
+        val traces = tracer.toSeq
+
+        assert(subChildTraceId != parentTraceId)
+        assert(traces.contains(Record(parentTraceId, Time.Bottom, Annotation.Rpc("outer"))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.Rpc(name))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.ServiceName("local"))))
+        assert(
+          traces.contains(
+            Record(childTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", name))))
+        assert(traces.contains(Record(childTraceId, startTime, Annotation.Message("local/begin"))))
+        assert(
+          traces.contains(
+            Record(childTraceId, startTime.plus(2.second), Annotation.Message("local/end"))))
+        assert(traces.contains(Record(subChildTraceId, Time.Bottom, Annotation.Rpc("sub"))))
+        assert(
+          traces.contains(Record(subChildTraceId, Time.Bottom, Annotation.ServiceName("local"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", "sub"))))
+        assert(
+          traces.contains(Record(subChildTraceId, startTime, Annotation.Message("local/begin"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, startTime.plus(1.second), Annotation.Message("local/end"))))
+        assert(parentTraceId != childTraceId)
+        assert(subChildTraceId.parentId == parentTraceId.spanId)
+
+        // IMPORTANT! `subChild` re-uses the parent trace within its scope,
+        // which makes `parent` its parent instead of `child` being the parent as it is in our other tests.
+        assert(childTraceId.parentId == parentTraceId.spanId)
+        assert(subChildTraceId != childTraceId)
+      }
+    }
+  }
+
+  test("support nested local spans (member with new scope)") {
+    val startTime = Time.now
+    Time.withTimeAt(startTime) { ctrl =>
+      val tracer = new BufferingTracer()
+      val parentTraceId = Trace.id
+      val name = "work"
+
+      Trace.letTracerAndId(tracer, parentTraceId) {
+        val trace = Trace()
+        trace.recordRpc("outer")
+
+        var subChildTraceId: TraceId = parentTraceId
+        val childTraceId = trace.traceLocal(name) {
+          val childTrace = Trace()
+          subChildTraceId = childTrace.traceLocal("sub") {
+            ctrl.advance(1.second)
+            Trace.id
+          }
+          ctrl.advance(1.second)
+
+          Trace.id
+        }
+
+        val traces = tracer.toSeq
+
+        assert(subChildTraceId != parentTraceId)
+        assert(traces.contains(Record(parentTraceId, Time.Bottom, Annotation.Rpc("outer"))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.Rpc(name))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.ServiceName("local"))))
+        assert(
+          traces.contains(
+            Record(childTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", name))))
+        assert(traces.contains(Record(childTraceId, startTime, Annotation.Message("local/begin"))))
+        assert(
+          traces.contains(
+            Record(childTraceId, startTime.plus(2.second), Annotation.Message("local/end"))))
+        assert(traces.contains(Record(subChildTraceId, Time.Bottom, Annotation.Rpc("sub"))))
+        assert(
+          traces.contains(Record(subChildTraceId, Time.Bottom, Annotation.ServiceName("local"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", "sub"))))
+        assert(
+          traces.contains(Record(subChildTraceId, startTime, Annotation.Message("local/begin"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, startTime.plus(1.second), Annotation.Message("local/end"))))
+        assert(parentTraceId != childTraceId)
+        assert(subChildTraceId.parentId == childTraceId.spanId)
+        assert(childTraceId.parentId == parentTraceId.spanId)
+        assert(subChildTraceId != childTraceId)
       }
     }
   }
@@ -522,18 +708,17 @@ class TraceTest extends AnyFunSuite with MockitoSugar with BeforeAndAfter with O
           fail("Expected exception to be thrown")
         } catch {
           case TraceIdException(childTraceId) =>
-            assert(tracer.toSeq.contains(Record(childTraceId, startTime, Annotation.Rpc(name))))
+            val traces = tracer.toSeq
+            assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.Rpc(name))))
             assert(
-              tracer.toSeq.contains(
-                Record(childTraceId, startTime, Annotation.ServiceName("local"))))
+              traces.contains(Record(childTraceId, Time.Bottom, Annotation.ServiceName("local"))))
             assert(
-              tracer.toSeq.contains(
-                Record(childTraceId, startTime, Annotation.BinaryAnnotation("lc", name))))
+              traces.contains(
+                Record(childTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", name))))
             assert(
-              tracer.toSeq.contains(
-                Record(childTraceId, startTime, Annotation.Message("local/begin"))))
+              traces.contains(Record(childTraceId, startTime, Annotation.Message("local/begin"))))
             assert(
-              tracer.toSeq.contains(
+              traces.contains(
                 Record(childTraceId, startTime.plus(1.second), Annotation.Message("local/end"))))
             assert(parentTraceId != childTraceId)
         }
@@ -556,20 +741,203 @@ class TraceTest extends AnyFunSuite with MockitoSugar with BeforeAndAfter with O
         ctrl.advance(1.second)
         mockTimer.tick()
 
-        val childTraceId = Await.result(childTraceIdFuture)
+        val childTraceId = Await.result(childTraceIdFuture, 1.second)
 
-        assert(tracer.toSeq.contains(Record(childTraceId, startTime, Annotation.Rpc(name))))
+        val traces = tracer.toSeq
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.Rpc(name))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.ServiceName("local"))))
         assert(
-          tracer.toSeq.contains(Record(childTraceId, startTime, Annotation.ServiceName("local"))))
+          traces.contains(
+            Record(childTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", name))))
+        assert(traces.contains(Record(childTraceId, startTime, Annotation.Message("local/begin"))))
         assert(
-          tracer.toSeq.contains(
-            Record(childTraceId, startTime, Annotation.BinaryAnnotation("lc", name))))
-        assert(
-          tracer.toSeq.contains(Record(childTraceId, startTime, Annotation.Message("local/begin"))))
-        assert(
-          tracer.toSeq.contains(
+          traces.contains(
             Record(childTraceId, startTime.plus(1.second), Annotation.Message("local/end"))))
         assert(parentTraceId != childTraceId)
+      }
+    }
+  }
+
+  test("trace async local span nested (static)") {
+    val mockTimer = new MockTimer()
+    val startTime = Time.now
+    Time.withTimeAt(startTime) { ctrl =>
+      val tracer = new BufferingTracer()
+      val parentTraceId = Trace.nextId
+      val name = "work"
+      Trace.letTracerAndId(tracer, parentTraceId) {
+        val trace = Trace()
+        trace.recordRpc("outer")
+        val subFuture = Promise[TraceId]()
+        val childTraceIdFuture = Trace.traceLocalFuture(name) {
+          Future.Done
+            .delayed(1.second)(mockTimer).flatMap { _ =>
+              Trace.traceLocalFuture("sub") {
+                subFuture.setValue(Trace.id)
+                subFuture
+              }
+            }.map(_ => Trace.id)
+        }
+
+        ctrl.advance(1.seconds)
+        mockTimer.tick()
+
+        val childTraceId = Await.result(childTraceIdFuture, 1.second)
+        val subChildTraceId = Await.result(subFuture, 1.second)
+
+        val traces = tracer.toSeq
+
+        assert(subChildTraceId != parentTraceId)
+        assert(traces.contains(Record(parentTraceId, Time.Bottom, Annotation.Rpc("outer"))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.Rpc(name))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.ServiceName("local"))))
+        assert(
+          traces.contains(
+            Record(childTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", name))))
+        assert(traces.contains(Record(childTraceId, startTime, Annotation.Message("local/begin"))))
+        assert(
+          traces.contains(
+            Record(childTraceId, startTime.plus(1.second), Annotation.Message("local/end"))))
+        assert(traces.contains(Record(subChildTraceId, Time.Bottom, Annotation.Rpc("sub"))))
+        assert(
+          traces.contains(Record(subChildTraceId, Time.Bottom, Annotation.ServiceName("local"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", "sub"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, startTime.plus(1.second), Annotation.Message("local/begin"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, startTime.plus(1.second), Annotation.Message("local/end"))))
+        assert(parentTraceId != childTraceId)
+        assert(subChildTraceId.parentId == childTraceId.spanId)
+        assert(childTraceId.parentId == parentTraceId.spanId)
+        assert(subChildTraceId != childTraceId)
+      }
+    }
+  }
+
+  test("trace async local span nested (without new scope)") {
+    val mockTimer = new MockTimer()
+    val startTime = Time.now
+    Time.withTimeAt(startTime) { ctrl =>
+      val tracer = new BufferingTracer()
+      val parentTraceId = Trace.nextId
+      val name = "work"
+      Trace.letTracerAndId(tracer, parentTraceId) {
+        val trace = Trace()
+        trace.recordRpc("outer")
+        val subFuture = Promise[TraceId]()
+        val childTraceIdFuture = trace.traceLocalFuture(name) {
+          Future.Done
+            .delayed(1.second)(mockTimer).flatMap { _ =>
+              trace.traceLocalFuture("sub") {
+                subFuture.setValue(Trace.id)
+                subFuture
+              }
+            }.map(_ => Trace.id)
+        }
+
+        ctrl.advance(1.seconds)
+        mockTimer.tick()
+
+        val childTraceId = Await.result(childTraceIdFuture, 1.second)
+        val subChildTraceId = Await.result(subFuture, 1.second)
+
+        val traces = tracer.toSeq
+
+        assert(subChildTraceId != parentTraceId)
+        assert(traces.contains(Record(parentTraceId, Time.Bottom, Annotation.Rpc("outer"))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.Rpc(name))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.ServiceName("local"))))
+        assert(
+          traces.contains(
+            Record(childTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", name))))
+        assert(traces.contains(Record(childTraceId, startTime, Annotation.Message("local/begin"))))
+        assert(
+          traces.contains(
+            Record(childTraceId, startTime.plus(1.second), Annotation.Message("local/end"))))
+        assert(traces.contains(Record(subChildTraceId, Time.Bottom, Annotation.Rpc("sub"))))
+        assert(
+          traces.contains(Record(subChildTraceId, Time.Bottom, Annotation.ServiceName("local"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", "sub"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, startTime.plus(1.second), Annotation.Message("local/begin"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, startTime.plus(1.second), Annotation.Message("local/end"))))
+        assert(parentTraceId != childTraceId)
+        assert(subChildTraceId.parentId == parentTraceId.spanId)
+
+        // IMPORTANT! `subChild` re-uses the parent trace within its scope,
+        // which makes `parent` its parent instead of `child` being the parent as it is in our other tests.
+        assert(childTraceId.parentId == parentTraceId.spanId)
+        assert(subChildTraceId != childTraceId)
+      }
+    }
+  }
+
+  test("trace async local span nested (with new scope)") {
+    val mockTimer = new MockTimer()
+    val startTime = Time.now
+    Time.withTimeAt(startTime) { ctrl =>
+      val tracer = new BufferingTracer()
+      val parentTraceId = Trace.nextId
+      val name = "work"
+      Trace.letTracerAndId(tracer, parentTraceId) {
+        val trace = Trace()
+        trace.recordRpc("outer")
+        val subFuture = Promise[TraceId]()
+        val childTraceIdFuture = trace.traceLocalFuture(name) {
+          val childTrace = Trace()
+          Future.Done
+            .delayed(1.second)(mockTimer).flatMap { _ =>
+              childTrace.traceLocalFuture("sub") {
+                subFuture.setValue(Trace.id)
+                subFuture
+              }
+            }.map(_ => Trace.id)
+        }
+
+        ctrl.advance(1.seconds)
+        mockTimer.tick()
+
+        val childTraceId = Await.result(childTraceIdFuture, 1.second)
+        val subChildTraceId = Await.result(subFuture, 1.second)
+
+        val traces = tracer.toSeq
+
+        assert(subChildTraceId != parentTraceId)
+        assert(traces.contains(Record(parentTraceId, Time.Bottom, Annotation.Rpc("outer"))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.Rpc(name))))
+        assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.ServiceName("local"))))
+        assert(
+          traces.contains(
+            Record(childTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", name))))
+        assert(traces.contains(Record(childTraceId, startTime, Annotation.Message("local/begin"))))
+        assert(
+          traces.contains(
+            Record(childTraceId, startTime.plus(1.second), Annotation.Message("local/end"))))
+        assert(traces.contains(Record(subChildTraceId, Time.Bottom, Annotation.Rpc("sub"))))
+        assert(
+          traces.contains(Record(subChildTraceId, Time.Bottom, Annotation.ServiceName("local"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", "sub"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, startTime.plus(1.second), Annotation.Message("local/begin"))))
+        assert(
+          traces.contains(
+            Record(subChildTraceId, startTime.plus(1.second), Annotation.Message("local/end"))))
+        assert(parentTraceId != childTraceId)
+        assert(subChildTraceId.parentId == childTraceId.spanId)
+        assert(childTraceId.parentId == parentTraceId.spanId)
+        assert(subChildTraceId != childTraceId)
       }
     }
   }
@@ -591,22 +959,21 @@ class TraceTest extends AnyFunSuite with MockitoSugar with BeforeAndAfter with O
         mockTimer.tick()
 
         try {
-          Await.result(childTraceIdFuture)
+          Await.result(childTraceIdFuture, 1.second)
           fail("Expected exception to be thrown")
         } catch {
           case TraceIdException(childTraceId) =>
-            assert(tracer.toSeq.contains(Record(childTraceId, startTime, Annotation.Rpc(name))))
+            val traces = tracer.toSeq
+            assert(traces.contains(Record(childTraceId, Time.Bottom, Annotation.Rpc(name))))
             assert(
-              tracer.toSeq.contains(
-                Record(childTraceId, startTime, Annotation.ServiceName("local"))))
+              traces.contains(Record(childTraceId, Time.Bottom, Annotation.ServiceName("local"))))
             assert(
-              tracer.toSeq.contains(
-                Record(childTraceId, startTime, Annotation.BinaryAnnotation("lc", name))))
+              traces.contains(
+                Record(childTraceId, Time.Bottom, Annotation.BinaryAnnotation("lc", name))))
             assert(
-              tracer.toSeq.contains(
-                Record(childTraceId, startTime, Annotation.Message("local/begin"))))
+              traces.contains(Record(childTraceId, startTime, Annotation.Message("local/begin"))))
             assert(
-              tracer.toSeq.contains(
+              traces.contains(
                 Record(childTraceId, startTime.plus(1.second), Annotation.Message("local/end"))))
             assert(parentTraceId != childTraceId)
         }
@@ -626,7 +993,7 @@ class TraceTest extends AnyFunSuite with MockitoSugar with BeforeAndAfter with O
 
         assert(
           tracer.toSeq.contains(
-            Record(traceId, startTime.plus(1.second), BinaryAnnotation("duration", 1.second))))
+            Record(traceId, Time.Bottom, BinaryAnnotation("duration", 1.second))))
       }
     }
   }
@@ -649,8 +1016,7 @@ class TraceTest extends AnyFunSuite with MockitoSugar with BeforeAndAfter with O
       Await.ready(result)
 
       assert(
-        tracer.toSeq.contains(
-          Record(traceId, startTime.plus(1.second), BinaryAnnotation("duration", 1.second))))
+        tracer.toSeq.contains(Record(traceId, Time.Bottom, BinaryAnnotation("duration", 1.second))))
     }
   }
 }

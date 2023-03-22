@@ -17,7 +17,7 @@ import com.twitter.finagle.ssl.server.SslServerConfiguration
 import com.twitter.finagle.stats.InMemoryStatsReceiver
 import com.twitter.finagle.stats.LoadedStatsReceiver
 import com.twitter.finagle.stats.NullStatsReceiver
-import com.twitter.finagle.stats.Server
+import com.twitter.finagle.stats.SourceRole
 import com.twitter.finagle.stats.StatsReceiver
 import com.twitter.finagle.stats.exp.ExpressionSchema
 import com.twitter.finagle.stats.exp.ExpressionSchemaKey
@@ -45,10 +45,17 @@ import org.apache.thrift.protocol.TProtocol
 import org.apache.thrift.protocol.TProtocolFactory
 import org.apache.thrift.transport.TTransport
 import org.scalatest.BeforeAndAfter
+import org.scalatest.concurrent.Eventually
+import org.scalatest.concurrent.IntegrationPatience
 import scala.reflect.ClassTag
 import org.scalatest.funsuite.AnyFunSuite
 
-class EndToEndTest extends AnyFunSuite with ThriftTest with BeforeAndAfter {
+class EndToEndTest
+    extends AnyFunSuite
+    with ThriftTest
+    with BeforeAndAfter
+    with Eventually
+    with IntegrationPatience {
   var saveBase: Dtab = Dtab.empty
   before {
     saveBase = Dtab.base
@@ -196,13 +203,18 @@ class EndToEndTest extends AnyFunSuite with ThriftTest with BeforeAndAfter {
       await(client.add(1, 2), 10.seconds)
     }
 
-    assert(sr.counters(Seq("requests")) == 1)
-    assert(sr.counters(Seq("success")) == 0)
-    assert(sr.counters(Seq("failures")) == 1)
+    eventually {
+      assert(sr.counters(Seq("requests")) == 1)
+      assert(sr.counters(Seq("success")) == 0)
+      assert(sr.counters(Seq("failures")) == 1)
 
-    assert(
-      sr.expressions.contains(
-        ExpressionSchemaKey("success_rate", Map(ExpressionSchema.Role -> Server.toString), Nil)))
+      assert(
+        sr.expressions.contains(
+          ExpressionSchemaKey(
+            "success_rate",
+            Map(ExpressionSchema.Role -> SourceRole.Server.toString),
+            Nil)))
+    }
 
     server.close()
   }
@@ -224,7 +236,7 @@ class EndToEndTest extends AnyFunSuite with ThriftTest with BeforeAndAfter {
     assert(idSet1 != idSet2)
   }
 
-  skipTestThrift("propagate Dtab") { (client, tracer) =>
+  skipTestThrift("propagate Dtab") { (client, _) =>
     Dtab.unwind {
       Dtab.local = Dtab.read("/a=>/b; /b=>/$/inet/google.com/80")
       val clientDtab = await(client.show_me_your_dtab(), 10.seconds)
@@ -232,7 +244,7 @@ class EndToEndTest extends AnyFunSuite with ThriftTest with BeforeAndAfter {
     }
   }
 
-  testThrift("(don't) propagate Dtab") { (client, tracer) =>
+  testThrift("(don't) propagate Dtab") { (client, _) =>
     val dtabSize = await(client.show_me_your_dtab_size(), 10.seconds)
     assert(dtabSize == 0)
   }
@@ -264,7 +276,9 @@ class EndToEndTest extends AnyFunSuite with ThriftTest with BeforeAndAfter {
         // These are set twice - by client and server
         assert(
           traces.collect {
-            case r @ Record(_, _, Annotation.BinaryAnnotation(_, _), _) => r
+            case r @ Record(_, _, Annotation.BinaryAnnotation(key, _), _)
+                if !key.contains("offload_pool_size") =>
+              r
           }.size == 15
         )
         assert(traces.collect { case Record(_, _, Annotation.ServerAddr(_), _) => () }.size == 2)
@@ -625,7 +639,7 @@ class EndToEndTest extends AnyFunSuite with ThriftTest with BeforeAndAfter {
       .withStack(clientStackForClassifier())
       .withStatsReceiver(sr)
       .withResponseClassifier(scalaClassifier)
-      .withRequestTimeout(100.milliseconds) // used in conjuection with a "slow" query
+      .withRequestTimeout(300.milliseconds) // used in conjunction with a "slow" query
       .build[Echo.MethodPerEndpoint](
         Name.bound(Address(server.boundAddress.asInstanceOf[InetSocketAddress])),
         "client"
@@ -863,7 +877,7 @@ class EndToEndTest extends AnyFunSuite with ThriftTest with BeforeAndAfter {
       .name("client")
       .reportTo(sr)
       .responseClassifier(scalaClassifier)
-      .requestTimeout(100.milliseconds) // used in conjuection with a "slow" query
+      .requestTimeout(100.milliseconds) // used in conjunction with a "slow" query
       .dest(Name.bound(Address(server.boundAddress.asInstanceOf[InetSocketAddress])))
       .build()
     val client = new Echo.FinagledClient(clientBuilder, RichClientParam())

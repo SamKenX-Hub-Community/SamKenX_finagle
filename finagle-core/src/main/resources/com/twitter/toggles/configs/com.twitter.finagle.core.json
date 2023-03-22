@@ -1,23 +1,13 @@
 {
   "toggles": [
     {
-      "id": "com.twitter.finagle.loadbalancer.WeightedAperture.v2",
-      "description": "Enable weight-aware aperture loadbalancers",
-      "fraction": 1.0
-    },
-    {
       "id": "com.twitter.finagle.service.DeadlineOnly",
       "description": "Ignore the user configured timeouts, only respect the deadline propagation in ATLA",
       "fraction": 0.0
     },
     {
-      "id": "com.twitter.finagle.tracing.ResourceTracing",
-      "description": "Enable the setting of the Resource Tracker on traced requests",
-      "fraction": 1.0
-    },
-    {
-      "id": "com.twitter.finagle.loadbalancer.PanicMode",
-      "description": "Load balancer fails open when fifty percent of the nodes are unhealthy",
+      "id": "com.twitter.finagle.filter.UseWorkQueueFiber",
+      "description": "When enabled, use a WorkQueueFiber for task scheduling. Only in ATLA.",
       "fraction": 0.0
     }
   ]

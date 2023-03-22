@@ -2,7 +2,9 @@ package com.twitter.finagle.client
 
 import com.twitter.finagle._
 import com.twitter.finagle.context
-import com.twitter.finagle.factory.{RefcountedFactory, StatsFactoryWrapper, TimeoutFactory}
+import com.twitter.finagle.factory.RefcountedFactory
+import com.twitter.finagle.factory.StatsFactoryWrapper
+import com.twitter.finagle.factory.TimeoutFactory
 import com.twitter.finagle.filter._
 import com.twitter.finagle.liveness.FailureAccrualFactory
 import com.twitter.finagle.loadbalancer.LoadBalancerFactory
@@ -10,10 +12,10 @@ import com.twitter.finagle.naming.BindingFactory
 import com.twitter.finagle.param._
 import com.twitter.finagle.service._
 import com.twitter.finagle.stack.nilStack
-import com.twitter.finagle.stats.{ClientStatsReceiver, LoadedHostStatsReceiver}
+import com.twitter.finagle.stats.ClientStatsReceiver
+import com.twitter.finagle.stats.LoadedHostStatsReceiver
 import com.twitter.finagle.tracing._
 import com.twitter.util.registry.GlobalRegistry
-import scala.collection.immutable.Queue
 
 object StackClient {
 
@@ -478,7 +480,7 @@ object StackClient {
     stk.push(ForwardAnnotation.module)
     stk.push(RegistryEntryLifecycle.module)
     stk.push(ClientExceptionTracingFilter.module())
-    stk.push(TraceInitializerFilter.clientModule)
+    stk.push(TraceInitializerFilter.clientModule())
     stk.result
   }
 
@@ -489,25 +491,20 @@ object StackClient {
     Stack.Params.empty +
       Stats(ClientStatsReceiver) +
       LoadBalancerFactory.HostStats(LoadedHostStatsReceiver) +
-      MetricBuilders(Some(new MetricBuilderRegistry()))
+      MetricBuilders(Some(new CoreMetricsRegistry())) +
+      // RetryBudget needs to be shared across one physical client.
+      Retries.Budget.default
 
   /**
    * A set of StackTransformers for transforming client stacks.
    */
-  private[twitter] object DefaultTransformer extends StackTransformerCollection
+  private[twitter] object DefaultTransformer
+      extends StackTransformerCollection[ClientStackTransformer]
 
   /**
    * A set of ClientParamsInjectors for transforming client params.
    */
-  private[finagle] object DefaultInjectors {
-    @volatile private var underlying = Queue.empty[ClientParamsInjector]
-
-    def append(injector: ClientParamsInjector): Unit =
-      synchronized { underlying = underlying :+ injector }
-
-    def injectors: Seq[ClientParamsInjector] =
-      underlying
-  }
+  object DefaultInjectors extends ParamsInjectorCollection[ClientParamsInjector]
 }
 
 /**

@@ -12,9 +12,9 @@ target(
     tags = ["bazel-compatible"],
     dependencies = [
         "3rdparty/jvm/junit",
-        "3rdparty/jvm/org/mockito:mockito-all",
+        "3rdparty/jvm/org/mockito:mockito-core",
         "3rdparty/jvm/org/scalatest",
-        "3rdparty/jvm/org/scalatestplus:mockito-1-10",
+        "3rdparty/jvm/org/scalatestplus:mockito",
         "finagle/finagle-core",
         "finagle/finagle-serversets",
         "src/java/com/twitter/common/io",
@@ -29,6 +29,7 @@ target(
 junit_tests(
     name = "defaultloader",
     sources = ["com/twitter/finagle/serverset2/client/apache/*.scala"],
+    platform = "java8",
     tags = ["bazel-compatible"],
     dependencies = [
         ":core",
@@ -45,6 +46,7 @@ junit_tests(
     name = "client",
     sources = ["com/twitter/finagle/serverset2/client/*.scala"],
     compiler_option_sets = ["fatal_warnings"],
+    platform = "java8",
     tags = ["bazel-compatible"],
     dependencies = [
         ":core",
@@ -63,6 +65,7 @@ junit_tests(
         "com/twitter/finagle/serverset2/naming/*.scala",
         "com/twitter/finagle/zookeeper/*.scala",
     ],
+    platform = "java8",
     tags = ["bazel-compatible"],
     dependencies = [
         ":core",

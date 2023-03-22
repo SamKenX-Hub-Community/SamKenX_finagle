@@ -9,7 +9,6 @@ import com.twitter.finagle.context.Contexts
 import com.twitter.finagle.dispatch.PipeliningDispatcher
 import com.twitter.finagle.liveness.FailureAccrualFactory
 import com.twitter.finagle.loadbalancer.Balancers
-import com.twitter.finagle.loadbalancer.LoadBalancerFactory
 import com.twitter.finagle.param.Label
 import com.twitter.finagle.param.Stats
 import com.twitter.finagle.param.{Tracer => PTracer}
@@ -174,7 +173,6 @@ class EndToEndTest
   test("end-to-end thriftmux with standard metrics") {
     val sr = new InMemoryStatsReceiver()
     LoadedStatsReceiver.self = sr
-    StandardStatsReceiver.serverCount.set(0)
     new ThriftMuxTestServer {
       val client = clientImpl.build[TestService.MethodPerEndpoint](
         Name.bound(Address(server.boundAddress.asInstanceOf[InetSocketAddress])),
@@ -183,8 +181,14 @@ class EndToEndTest
       assert(await(client.query("ok")) == "okok")
 
       assert(sr.counter("standard-service-metric-v1", "srv", "requests")() == 1)
-      assert(
-        sr.counter("standard-service-metric-v1", "srv", "thriftmux", "server-0", "requests")() == 1)
+
+      val metricKey = sr.counters.keys.collectFirst {
+        case key @ Seq("standard-service-metric-v1", "srv", "thriftmux", x, "requests")
+            if x.startsWith("server-") =>
+          key
+      }.get
+
+      assert(sr.counter(metricKey: _*)() == 1)
 
       await(server.close())
     }
@@ -193,11 +197,9 @@ class EndToEndTest
   test("end-to-end thriftmux aperture_least_loaded_weighted client") {
     val sr = new InMemoryStatsReceiver()
     LoadedStatsReceiver.self = sr
-    StandardStatsReceiver.serverCount.set(0)
     new ThriftMuxTestServer {
       val client = clientImpl
         .withLoadBalancer(Balancers.aperture())
-        .configured(LoadBalancerFactory.UseWeightedBalancers(true))
         .build[TestService.MethodPerEndpoint](
           Name.bound(Address(server.boundAddress.asInstanceOf[InetSocketAddress])),
           "client"
@@ -217,8 +219,15 @@ class EndToEndTest
       assert(await(client.query("ok")) == "okok")
 
       assert(sr.counter("standard-service-metric-v1", "srv", "requests")() == 1)
+
+      val metricKey = sr.counters.keys.collectFirst {
+        case k @ Seq("standard-service-metric-v1", "srv", "thriftmux", server, "requests")
+            if server.startsWith("server-") =>
+          k
+      }.get
+
       assert(
-        sr.counter("standard-service-metric-v1", "srv", "thriftmux", "server-0", "requests")() == 1
+        sr.counter(metricKey: _*)() == 1
       )
 
       assert(sr.gauges(Seq("clnt", "client", "connections"))() == 1)
@@ -471,6 +480,7 @@ class EndToEndTest
         }
       }
       def sampleTrace(traceId: TraceId): Option[Boolean] = None
+      def getSampleRate: Float = 0f
     }
 
     val server = serverImpl
@@ -519,6 +529,7 @@ class EndToEndTest
         }
       }
       def sampleTrace(traceId: TraceId): Option[Boolean] = None
+      def getSampleRate: Float = 0f
     }
 
     Time.withTimeAt(Time.fromSeconds(1465510280)) { tc => // Thursday, June 9, 2016 10:11:20 PM
@@ -572,6 +583,7 @@ class EndToEndTest
         }
       }
       def sampleTrace(traceId: TraceId): Option[Boolean] = Tracer.SomeTrue
+      def getSampleRate: Float = 1f
     }
 
     val serverRpc = new AtomicReference[String]()
@@ -616,6 +628,7 @@ class EndToEndTest
         }
       }
       def sampleTrace(traceId: TraceId): Option[Boolean] = Tracer.SomeTrue
+      def getSampleRate: Float = 1f
     }
     val server = serverImpl
       .withTracer(serverTracer)
@@ -645,6 +658,7 @@ class EndToEndTest
         }
       }
       def sampleTrace(traceId: TraceId): Option[Boolean] = Tracer.SomeTrue
+      def getSampleRate: Float = 1f
     }
 
     val client = clientImpl
@@ -679,6 +693,7 @@ class EndToEndTest
         }
       }
       def sampleTrace(traceId: TraceId): Option[Boolean] = Tracer.SomeTrue
+      def getSampleRate: Float = 1f
     }
     val server = serverImpl
       .withTracer(serverTracer)
@@ -758,6 +773,38 @@ class EndToEndTest
     1 to 5 foreach { _ =>
       otherClientId.asCurrent {
         assert(await(client.query("ok")) == clientId.name)
+      }
+    }
+
+    await(server.close())
+  }
+
+  test(
+    "thriftmux server + Finagle thrift client: ClientId can be overridable externally if we want") {
+    val server = serverImpl.serveIface(
+      new InetSocketAddress(InetAddress.getLoopbackAddress, 0),
+      new TestService.MethodPerEndpoint {
+        def query(x: String): Future[String] =
+          Future.value(ClientId.current.map(_.name).getOrElse("No ClientId"))
+        def question(y: String): Future[String] =
+          Future.value(ClientId.current.map(_.name).getOrElse("No ClientId"))
+        def inquiry(z: String): Future[String] =
+          Future.value(ClientId.current.map(_.name).getOrElse("No ClientId"))
+      }
+    )
+
+    val clientId = ClientId("test.service")
+    val otherClientId = ClientId("other.bar")
+    val client = Thrift.client
+      .withClientId(clientId)
+      .build[TestService.MethodPerEndpoint](
+        Name.bound(Address(server.boundAddress.asInstanceOf[InetSocketAddress])),
+        "client"
+      )
+
+    1 to 5 foreach { _ =>
+      otherClientId.asOverride {
+        assert(await(client.query("ok")) == otherClientId.name)
       }
     }
 
@@ -887,6 +934,35 @@ class EndToEndTest
 
     otherClientId.asCurrent {
       assert(await(client.query("ok")) == clientId.name)
+    }
+
+    await(server.close())
+  }
+
+  test("thriftmux server + thriftmux client: ClientId can overridden when we want") {
+    val server = serverImpl.serveIface(
+      new InetSocketAddress(InetAddress.getLoopbackAddress, 0),
+      new TestService.MethodPerEndpoint {
+        def query(x: String): Future[String] =
+          Future.value(ClientId.current.map(_.name).getOrElse(""))
+        def question(y: String): Future[String] =
+          Future.value(ClientId.current.map(_.name).getOrElse(""))
+        def inquiry(z: String): Future[String] =
+          Future.value(ClientId.current.map(_.name).getOrElse(""))
+      }
+    )
+
+    val clientId = ClientId("test.service")
+    val otherClientId = ClientId("other.bar")
+    val client = clientImpl
+      .withClientId(clientId)
+      .build[TestService.MethodPerEndpoint](
+        Name.bound(Address(server.boundAddress.asInstanceOf[InetSocketAddress])),
+        "client"
+      )
+
+    otherClientId.asOverride {
+      assert(await(client.query("ok")) == otherClientId.name)
     }
 
     await(server.close())
@@ -2019,6 +2095,7 @@ class EndToEndTest
           Future.exception(new Exception)
         }
         def close(deadline: Time): Future[Unit] = Future.Done
+        def status: Status = Status.Open
       }
     )
 
@@ -2030,6 +2107,7 @@ class EndToEndTest
           Future.exception(new Exception)
         }
         def close(deadline: Time): Future[Unit] = Future.Done
+        def status: Status = Status.Open
       }
     )
 
@@ -2238,6 +2316,7 @@ class EndToEndTest
             def apply(conn: ClientConnection): Future[Nothing] =
               Future.exception(new Exception("unhappy"))
             def close(deadline: Time): Future[Unit] = Future.Done
+            def status: Status = Status.Open
           }
         )
 
@@ -2250,6 +2329,7 @@ class EndToEndTest
             def apply(conn: ClientConnection): Future[Nothing] =
               Future.exception(new Exception("unhappy"))
             def close(deadline: Time): Future[Unit] = Future.Done
+            def status: Status = Status.Open
           }
         )
 
@@ -2284,7 +2364,9 @@ class EndToEndTest
       // we don't expect to see any retries.
       assert(sr.counters(Seq("client", "retries", "requeues")) == 0)
       assert(sr.counters(Seq("client", "connects")) == 1)
-      assert(sr.counters(Seq("client", "mux", "draining")) == 1)
+      eventually {
+        assert(sr.counters(Seq("client", "mux", "draining")) == 1)
+      }
       await(closeServers())
     }
   }

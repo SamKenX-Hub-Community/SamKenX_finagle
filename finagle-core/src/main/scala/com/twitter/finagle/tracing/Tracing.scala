@@ -7,8 +7,8 @@ import com.twitter.util.Future
 import com.twitter.util.Stopwatch
 import com.twitter.util.Time
 import java.net.InetSocketAddress
-import java.util.concurrent.ConcurrentHashMap
 import java.util.Random
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ThreadLocalRandom
 import scala.annotation.tailrec
 
@@ -21,6 +21,8 @@ object Tracing {
   private[tracing] val notSampled = tracingStats.counter("not_sampled")
   private[tracing] val deferred = tracingStats.counter("deferred")
   private val localSpans = tracingStats.counter("local_spans")
+  val LocalBeginAnnotation: String = "local/begin"
+  val LocalEndAnnotation: String = "local/end"
 
   @tailrec private[tracing] def nextSpanId(r: Random): SpanId = {
     val nextLong = r.nextLong()
@@ -163,6 +165,25 @@ abstract class Tracing {
   }
 
   /**
+   * Create a derived id from the current [[TraceId]].
+   * Whereas nextId derives a new Id by making it a child of the current,
+   * peerId creates a new Id by making it a peer of the current
+   */
+  final def peerId: TraceId = {
+    idOption match {
+      case Some(id) =>
+        TraceId(
+          Some(id.traceId),
+          Some(id.parentId),
+          nextSpanId(ThreadLocalRandom.current()),
+          id.sampled,
+          id.flags,
+          id.traceIdHigh)
+      case None => newId
+    }
+  }
+
+  /**
    * Record a raw [[Record]]. This will record to a _unique_ set of tracers in the stack.
    */
   final def record(rec: Record): Unit = tracers.record(rec)
@@ -202,6 +223,11 @@ abstract class Tracing {
 
   final def record(ann: Annotation, duration: Duration): Unit =
     record(Record(id, Time.nowNanoPrecision, ann, Some(duration)))
+
+  // we're putting in a placeholder start value in here because we don't really
+  // need it for binary annotations.
+  private[this] final def recordBinary(ann: Annotation): Unit =
+    record(Record(id, Time.Bottom, ann, None))
 
   final def recordWireSend(): Unit =
     record(Annotation.WireSend)
@@ -251,26 +277,26 @@ abstract class Tracing {
     record(Annotation.Message(message), duration)
 
   final def recordServiceName(serviceName: String): Unit =
-    record(Annotation.ServiceName(serviceName))
+    recordBinary(Annotation.ServiceName(serviceName))
 
   final def recordRpc(name: String): Unit =
-    record(Annotation.Rpc(name))
+    recordBinary(Annotation.Rpc(name))
 
   final def recordClientAddr(ia: InetSocketAddress): Unit =
-    record(Annotation.ClientAddr(ia))
+    recordBinary(Annotation.ClientAddr(ia))
 
   final def recordServerAddr(ia: InetSocketAddress): Unit =
-    record(Annotation.ServerAddr(ia))
+    recordBinary(Annotation.ServerAddr(ia))
 
   final def recordLocalAddr(ia: InetSocketAddress): Unit =
-    record(Annotation.LocalAddr(ia))
+    recordBinary(Annotation.LocalAddr(ia))
 
   final def recordBinary(key: String, value: Any): Unit =
-    record(Annotation.BinaryAnnotation(key, value))
+    recordBinary(Annotation.BinaryAnnotation(key, value))
 
   final def recordBinaries(annotations: Map[String, Any]): Unit = {
     for ((key, value) <- annotations) {
-      recordBinary(key, value)
+      recordBinary(Annotation.BinaryAnnotation(key, value))
     }
   }
 
@@ -309,9 +335,6 @@ abstract class Tracing {
       case None => "local"
     }
   }
-
-  val LocalBeginAnnotation: String = "local/begin"
-  val LocalEndAnnotation: String = "local/end"
 
   /**
    * Convenience method for event loops in services.  Put your
@@ -407,14 +430,15 @@ abstract class Tracing {
    *
    * @note This method does *not* check `isActivelyTracing` -- the onus is on the user to include this check.
    */
-  final protected def recordLocalSpan(name: String, timestamp: Time, duration: Duration): Unit = {
-    val lid = id
+  private[this] def recordLocalSpan(name: String, timestamp: Time, duration: Duration): Unit = {
+    // the correct local id information needs to be retrieved from the local scope
+    val lid = Trace.id
     // these annotations are necessary to get the
     // zipkin ui to properly display the span.
     localSpans.incr()
-    record(Record(lid, timestamp, Annotation.Rpc(name)))
-    record(Record(lid, timestamp, Annotation.ServiceName(serviceName)))
-    record(Record(lid, timestamp, Annotation.BinaryAnnotation("lc", name)))
+    record(Record(lid, Time.Bottom, Annotation.Rpc(name)))
+    record(Record(lid, Time.Bottom, Annotation.ServiceName(serviceName)))
+    record(Record(lid, Time.Bottom, Annotation.BinaryAnnotation("lc", name)))
     record(Record(lid, timestamp, Annotation.Message(LocalBeginAnnotation)))
     record(Record(lid, timestamp + duration, Annotation.Message(LocalEndAnnotation)))
   }

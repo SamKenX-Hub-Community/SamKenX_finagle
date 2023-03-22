@@ -7,6 +7,7 @@ import com.twitter.finagle.context.BackupRequest
 import com.twitter.finagle.naming.BindingFactory.Dest
 import com.twitter.finagle.param.Label
 import com.twitter.finagle.param.ProtocolLibrary
+import com.twitter.finagle.server.ServerInfo
 import com.twitter.finagle.service.ReqRep
 import com.twitter.finagle.service.ResponseClass
 import com.twitter.finagle.service.ResponseClassifier
@@ -51,12 +52,9 @@ object BackupRequestFilter {
    */
   private val MinSendBackupAfterMs: Int = 1
 
-  private[finagle] val supersededBackupRequestWhy =
+  // testing purpose, we need to monitor changes of this message
+  private[finagle] val SupersededRequestFailureWhy =
     "Request was superseded by another in BackupRequestFilter"
-
-  private[finagle] val SupersededRequestFailure = Failure.ignorable(supersededBackupRequestWhy)
-
-  private[finagle] val SupersededRequestFailureToString = SupersededRequestFailure.toString
 
   private val log = Logger.get(this.getClass.getName)
 
@@ -77,7 +75,12 @@ object BackupRequestFilter {
     else
       RetryBudget(
         ttl = RetryBudget.DefaultTtl,
-        minRetriesPerSec = RetryBudget.DefaultMinRetriesPerSec,
+        // Set minRetriesPerSec to 0 to ensure that the BackupRequestFilter respects the
+        // maxExtraLoad configured. This means that low QPS clients won't send more backups than
+        // allowed just by sending minRetriesPerSec. The tradeoff is that backups may be slow to
+        // kick in for a new client while QPS is temporarily low, but as QPS rises this issue will
+        // go away.
+        minRetriesPerSec = 0,
         percentCanRetry = maxExtraLoad,
         nowMillis
       )
@@ -136,6 +139,12 @@ object BackupRequestFilter {
    * @param minSendBackupAfterMs Use a minimum non-zero delay to prevent sending unnecessary backup requests
    *                             immediately for services where the latency at the percentile where a
    *                             backup will be sent is ~0ms.
+   *
+   * @note Clients using a maxExtraLoad of 1% will need to get at least 10 QPS in order for any
+   * backups to be sent at all because the BackupRequestFilter's retryBudget has a TTL of 10 seconds
+   * for deposits (that is, 100 requests need to occur within 10 seconds before a single backup is
+   * allowed). The maxExtraLoad can be increased for these clients if they hope to see backups at
+   * lower QPS rates.
    */
   def Configured(
     maxExtraLoad: Double,
@@ -163,6 +172,8 @@ object BackupRequestFilter {
    *                       is returned and the result of the outstanding request is superseded. For
    *                       protocols without a control plane, where the connection is cut on
    *                       interrupts, this should be "false" to avoid connection churn
+   *
+   * @note See `Configured` above for note about low QPS clients and maxExtraLoad
    */
   def Configured(maxExtraLoad: Double, sendInterrupts: Boolean): Param = {
     require(
@@ -186,6 +197,8 @@ object BackupRequestFilter {
    * @param minSendBackupAfterMs Use a minimum non-zero delay to prevent sending unnecessary backup
    *                             requests immediately for services where the latency at the percentile
    *                             where a backup will be sent is ~0ms.
+   *
+   * @note See `Configured` above for note about low QPS clients and maxExtraLoad
    */
   def Configured(
     maxExtraLoad: Tunable[Double],
@@ -212,7 +225,8 @@ object BackupRequestFilter {
       params[Histogram].lowestDiscernibleMsValue,
       params[Histogram].highestTrackableMsValue,
       params[param.Stats].statsReceiver.scope("backups"),
-      params[param.Timer].timer
+      params[param.Timer].timer,
+      params[param.Label].label
     )
 
   /**
@@ -247,6 +261,20 @@ object BackupRequestFilter {
     service: Service[Req, Rep],
     keyPrefixes: Seq[String]
   ): Service[Req, Rep] =
+    filterWithPrefixes[Req, Rep](params, keyPrefixes) match {
+      case Some(brf) =>
+        new ServiceProxy[Req, Rep](brf.andThen(service)) {
+          override def close(deadline: Time): Future[Unit] =
+            service.close(deadline).before(brf.close(deadline))
+        }
+
+      case None => service
+    }
+
+  private[client] def filterWithPrefixes[Req, Rep](
+    params: Stack.Params,
+    keyPrefixes: Seq[String]
+  ): Option[BackupRequestFilter[Req, Rep]] =
     params[BackupRequestFilter.Param] match {
       case BackupRequestFilter.Param
             .Configured(maxExtraLoad, sendInterrupts, minSendBackupAfterMs) =>
@@ -257,14 +285,11 @@ object BackupRequestFilter {
           val prefixes = keyPrefixes ++ Seq(BackupRequestFilter.role.name, value)
           ClientRegistry.export(params, prefixes: _*)
         }
-        val brf =
-          mkFilterFromParams[Req, Rep](maxExtraLoad, sendInterrupts, minSendBackupAfterMs, params)
-        new ServiceProxy[Req, Rep](brf.andThen(service)) {
-          override def close(deadline: Time): Future[Unit] =
-            service.close(deadline).before(brf.close(deadline))
-        }
+
+        Some(
+          mkFilterFromParams[Req, Rep](maxExtraLoad, sendInterrupts, minSendBackupAfterMs, params))
       case BackupRequestFilter.Param.Disabled =>
-        service
+        None
     }
 
   def module[Req, Rep]: Stackable[ServiceFactory[Req, Rep]] =
@@ -355,7 +380,8 @@ private[finagle] class BackupRequestFilter[Req, Rep](
   nowMs: () => Long,
   statsReceiver: StatsReceiver,
   timer: Timer,
-  windowedPercentileHistogramFac: () => WindowedPercentileHistogram)
+  windowedPercentileHistogramFac: () => WindowedPercentileHistogram,
+  serviceName: String)
     extends SimpleFilter[Req, Rep]
     with Closable {
   import BackupRequestFilter._
@@ -367,7 +393,8 @@ private[finagle] class BackupRequestFilter[Req, Rep](
     responseClassifier: ResponseClassifier,
     clientRetryBudget: RetryBudget,
     statsReceiver: StatsReceiver,
-    timer: Timer
+    timer: Timer,
+    serviceName: String
   ) =
     this(
       maxExtraLoadTunable,
@@ -379,7 +406,8 @@ private[finagle] class BackupRequestFilter[Req, Rep](
       Stopwatch.systemMillis,
       statsReceiver,
       timer,
-      () => new WindowedPercentileHistogram(timer)
+      () => new WindowedPercentileHistogram(timer),
+      serviceName
     )
 
   def this(
@@ -391,7 +419,8 @@ private[finagle] class BackupRequestFilter[Req, Rep](
     lowestDiscernibleMsValue: Int,
     highestTrackableMsValue: Int,
     statsReceiver: StatsReceiver,
-    timer: Timer
+    timer: Timer,
+    serviceName: String
   ) =
     this(
       maxExtraLoadTunable,
@@ -410,10 +439,16 @@ private[finagle] class BackupRequestFilter[Req, Rep](
           lowestDiscernibleMsValue,
           highestTrackableMsValue,
           timer
-        )
+        ),
+      serviceName
     )
   @volatile private[this] var backupRequestRetryBudget: RetryBudget =
     newRetryBudget(getAndValidateMaxExtraLoad(maxExtraLoadTunable), nowMs)
+
+  private[this] val SupersededRequestFailure = Failure
+    .ignorable(SupersededRequestFailureWhy)
+    .withSource(Failure.Source.Service, serviceName)
+    .withSource(Failure.Source.AppId, ServerInfo().id)
 
   private[this] def percentileFromMaxExtraLoad(maxExtraLoad: Double): Double =
     1.0 - maxExtraLoad

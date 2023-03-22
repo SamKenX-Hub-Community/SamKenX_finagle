@@ -5,7 +5,6 @@ import com.twitter.finagle.client.MethodBuilderTimeout.TunableDuration
 import com.twitter.finagle.service.Filterable
 import com.twitter.finagle.service.ResponseClass
 import com.twitter.finagle.service.ResponseClassifier
-import com.twitter.finagle.service.Retries
 import com.twitter.finagle.service.TimeoutFilter
 import com.twitter.finagle.stats.LazyStatsReceiver
 import com.twitter.finagle.stats.StatsReceiver
@@ -20,6 +19,7 @@ import com.twitter.finagle.Stack
 import com.twitter.finagle.param
 import com.twitter.finagle._
 import com.twitter.util.tunable.Tunable
+import com.twitter.util.Closable
 import com.twitter.util.CloseOnce
 import com.twitter.util.Future
 import com.twitter.util.Time
@@ -55,6 +55,7 @@ object MethodBuilder {
    */
   def from[Req, Rep](dest: Name, stackClient: StackClient[Req, Rep]): MethodBuilder[Req, Rep] = {
     val stack = modifiedStack(stackClient.stack)
+
     new MethodBuilder(
       new MethodPool[Req, Rep](stackClient.withStack(stack), dest, param.Label.Default),
       dest,
@@ -72,13 +73,18 @@ object MethodBuilder {
     stack: Stack[ServiceFactory[Req, Rep]]
   ): Stack[ServiceFactory[Req, Rep]] = {
     stack
-    // backup requests happen before the stack's filters so MethodBuilder
-    // has to place this before (outside of the stack).
+    // We need to move trace initializing filter up so it "covers' MB's own
+    // filters such as retries and backups.
       .remove(TraceInitializerFilter.role)
       // total timeouts are managed directly by MethodBuilder
       .remove(TimeoutFilter.totalTimeoutRole)
       // allow for dynamic per-request timeouts
       .replace(TimeoutFilter.role, DynamicTimeout.perRequestModule[Req, Rep])
+      // If the stack we're working with had support for dynamic BRF, let's install the
+      // real filter instead of a placeholder.
+      .replace(
+        DynamicBackupRequestFilter.role,
+        DynamicBackupRequestFilter.perRequestModule[Req, Rep])
   }
 
   private[finagle] object Config {
@@ -113,7 +119,8 @@ object MethodBuilder {
     traceInitializer: Filter.TypeAgnostic,
     retry: MethodBuilderRetry.Config,
     timeout: MethodBuilderTimeout.Config,
-    filter: Filter.TypeAgnostic = Filter.typeAgnosticIdentity)
+    filter: Filter.TypeAgnostic = Filter.typeAgnosticIdentity,
+    backup: BackupRequestFilter.Param = BackupRequestFilter.Param.Disabled)
 
   /** Used by the `ClientRegistry` */
   private[client] val RegistryKey = "methods"
@@ -238,6 +245,12 @@ final class MethodBuilder[Req, Rep] private[finagle] (
    *                   These determinations are also reflected in stats, and used by
    *                   [[FailureAccrualFactory]].
    *
+   * @note Clients using a maxExtraLoad of 1% will need to get at least 10 QPS in order for any
+   * backups to be sent at all because the BackupRequestFilter's retryBudget has a TTL of 10 seconds
+   * for deposits (that is, 100 requests need to occur within 10 seconds before a single backup is
+   * allowed). The maxExtraLoad can be increased for these clients if they hope to see backups at
+   * lower QPS rates.
+   *
    * @note See `idempotent` below for a version that takes a [[Tunable[Double]]] for `maxExtraLoad`.
    */
   def idempotent(
@@ -270,6 +283,8 @@ final class MethodBuilder[Req, Rep] private[finagle] (
    *                   whether or not requests have succeeded and should be retried.
    *                   These determinations are also reflected in stats, and used by
    *                   [[FailureAccrualFactory]].
+   *
+   * @note See `idempotent` above for note about low QPS clients and maxExtraLoad
    */
   def idempotent(
     maxExtraLoad: Double,
@@ -308,6 +323,8 @@ final class MethodBuilder[Req, Rep] private[finagle] (
    *                   whether or not requests have succeeded and should be retried.
    *                   These determinations are also reflected in stats, and used by
    *                   [[FailureAccrualFactory]].
+   *
+   * @note See `idempotent` above for note about low QPS clients and maxExtraLoad
    */
   def idempotent(
     maxExtraLoad: Tunable[Double],
@@ -339,6 +356,8 @@ final class MethodBuilder[Req, Rep] private[finagle] (
    *                   whether or not requests have succeeded and should be retried.
    *                   These determinations are also reflected in stats, and used by
    *                   [[FailureAccrualFactory]].
+   *
+   * @note See `idempotent` above for note about low QPS clients and maxExtraLoad
    */
   def idempotent(
     maxExtraLoad: Tunable[Double],
@@ -359,12 +378,7 @@ final class MethodBuilder[Req, Rep] private[finagle] (
       case Some(classifier) => classifier.orElse(protocolClassifier)
       case None => protocolClassifier
     }
-    ResponseClassifier.named(s"Idempotent($combined)") {
-      case reqrep if combined.isDefinedAt(reqrep) =>
-        val result = combined(reqrep)
-        if (result == ResponseClass.NonRetryableFailure) ResponseClass.RetryableFailure
-        else result
-    }
+    ResponseClassifier.named(s"Idempotent($combined)")(combined)
   }
 
   private[this] def addBackupRequestFilterParamAndClassifier(
@@ -374,18 +388,15 @@ final class MethodBuilder[Req, Rep] private[finagle] (
     val configClassifier = config.retry.underlyingClassifier
     val idempotentedConfigClassifier = idempotentify(configClassifier, classifier)
 
-    new MethodBuilder[Req, Rep](
+    val base = new MethodBuilder[Req, Rep](
       methodPool,
       dest,
       stack,
-      // If the RetryBudget is not configured, BackupRequestFilter and RetryFilter will each
-      // get a new instance of the default budget. Since we want them to share the same
-      // client retry budget, insert the budget into the params.
-      params
-        + brfParam
-        + params[Retries.Budget],
-      config
-    ).withRetry.forClassifier(idempotentedConfigClassifier)
+      params,
+      config.copy(backup = brfParam)
+    )
+
+    base.withRetry.forClassifier(idempotentedConfigClassifier)
   }
 
   private[this] def nonidempotentify(
@@ -421,8 +432,8 @@ final class MethodBuilder[Req, Rep] private[finagle] (
       methodPool,
       dest,
       stack,
-      params + BackupRequestFilter.Disabled,
-      config
+      params,
+      config.copy(backup = BackupRequestFilter.Param.Disabled)
     ).withRetry.forClassifier(nonidempotentedConfigClassifier)
   }
 
@@ -449,7 +460,7 @@ final class MethodBuilder[Req, Rep] private[finagle] (
   //
   private[this] def newService(methodName: Option[String]): Service[Req, Rep] = {
     materialize()
-    val withStats = configured(param.Stats(statsReceiver(methodName)))
+    val withStats = withStatsForMethod(methodName)
     withStats.filters(methodName).andThen(withStats.wrappedService(methodName))
   }
 
@@ -486,7 +497,7 @@ final class MethodBuilder[Req, Rep] private[finagle] (
   ): ServicePerEndpoint = {
     materialize()
 
-    val withStats = configured(param.Stats(statsReceiver(methodName)))
+    val withStats = withStatsForMethod(methodName)
 
     builder
       .servicePerEndpoint(withStats.wrappedService(methodName))
@@ -518,6 +529,13 @@ final class MethodBuilder[Req, Rep] private[finagle] (
       case Some(name) => new LazyStatsReceiver(clientScoped.scope(name))
       case None => clientScoped
     }
+  }
+
+  private[this] def withStatsForMethod(methodName: Option[String]): MethodBuilder[Req, Rep] = {
+    val sr = statsReceiver(methodName)
+    // We update the backup request filter config (brfConfig) here with the method name
+    // and stats receiver because this information wasn't available when `idemptotent` is called.
+    configured(param.Stats(sr))
   }
 
   private[this] def materialize(): Unit = {
@@ -612,35 +630,78 @@ final class MethodBuilder[Req, Rep] private[finagle] (
     }
   }
 
+  private class WrappedService(name: Option[String], underlying: Service[Req, Rep])
+      extends ServiceProxy[Req, Rep](underlying)
+      with CloseOnce {
+
+    protected def dispatch(request: Req): Future[Rep] = underlying(request)
+    protected def toClose: Closable = Closable.nop
+
+    override def apply(request: Req): Future[Rep] =
+      if (isClosed) Future.exception(new ServiceClosedException())
+      else dispatch(request)
+
+    override def status: Status =
+      if (isClosed) Status.Closed
+      else underlying.status
+
+    override protected def closeOnce(deadline: Time): Future[Unit] = {
+      // remove our method builder's entries from the registry
+      ClientRegistry.unregisterPrefixes(registryEntry(), registryKeyPrefix(name))
+
+      // call refCounted.close to decrease the ref count. `underlying.close` is only
+      // called when the closable underlying `refCounted` is closed.
+      Closable
+        .sequence(
+          methodPool,
+          toClose,
+          underlying
+        ).close(deadline)
+    }
+  }
+
   private def wrappedService(name: Option[String]): Service[Req, Rep] = {
     addToRegistry(name)
     methodPool.open()
 
+    val underlying = methodPool.get
+
     val backupRequestParams = params +
+      config.backup +
       param.ResponseClassifier(config.retry.responseClassifier)
 
     // register BackupRequestFilter under the same prefixes as other method entries
     val prefixes = Seq(registryEntry().addr) ++ registryKeyPrefix(name)
-    val underlying = BackupRequestFilter
-      .filterServiceWithPrefix(backupRequestParams, methodPool.get, prefixes)
+    val backupsFilter = BackupRequestFilter
+      .filterWithPrefixes[Any, Any](backupRequestParams, prefixes)
 
-    new ServiceProxy[Req, Rep](underlying) with CloseOnce {
-      override def apply(request: Req): Future[Rep] =
-        if (isClosed) Future.exception(new ServiceClosedException())
-        else super.apply(request)
+    // Depending on what underlying protocol we're dealing with, we either apply backups filter
+    // right away or pass it down in a local to apply later (in ThriftMux, HTTP, "later" is after
+    // partitioning).
+    val supportsPerRequestBackups = stack.contains(DynamicBackupRequestFilter.role)
 
-      override def status: Status =
-        if (isClosed) Status.Closed
-        else underlying.status
+    backupsFilter match {
+      case Some(filter) if supportsPerRequestBackups =>
+        // Dynamic BRF is available. Let's set the local.
+        new WrappedService(name, underlying) {
+          override protected def dispatch(request: Req): Future[Rep] =
+            DynamicBackupRequestFilter.let(filter) {
+              underlying(request)
+            }
+          override protected def toClose: Closable = filter
+        }
 
-      override protected def closeOnce(deadline: Time): Future[Unit] = {
-        // remove our method builder's entries from the registry
-        ClientRegistry.unregisterPrefixes(registryEntry(), registryKeyPrefix(name))
-        // call refCounted.close to decrease the ref count. `underlying.close` is only
-        // called when the closable underlying `refCounted` is closed.
-        methodPool.close(deadline).transform(_ => underlying.close(deadline))
-      }
+      case Some(filter) =>
+        // Dynamic BRF is not available. Apply BRF right away.
+        new WrappedService(name, underlying) {
+          override protected def dispatch(request: Req): Future[Rep] =
+            filter.asInstanceOf[Filter[Req, Rep, Req, Rep]].apply(request, underlying)
+          override protected def toClose: Closable = filter
+        }
+
+      case None =>
+        // BRF is disabled.
+        new WrappedService(name, underlying)
     }
   }
-
 }

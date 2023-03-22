@@ -1,16 +1,15 @@
 import Tests._
-import scoverage.ScoverageKeys
 
 Global / onChangedBuildSource := ReloadOnSourceChanges
 Global / excludeLintKeys += scalacOptions
 
 // All Twitter library releases are date versioned as YY.MM.patch
-val releaseVersion = "22.5.0-SNAPSHOT"
+val releaseVersion = "23.3.0-SNAPSHOT"
 
 val libthriftVersion = "0.10.0"
 
-val defaultNetty4Version = "4.1.76.Final"
-val defaultNetty4StaticSslVersion = "2.0.51.Final"
+val defaultNetty4Version = "4.1.78.Final"
+val defaultNetty4StaticSslVersion = "2.0.53.Final"
 
 val useNettySnapshot: Boolean = sys.env.get("FINAGLE_USE_NETTY_4_SNAPSHOT") match {
   case Some(useSnapshot) => useSnapshot.toBoolean
@@ -42,11 +41,12 @@ val scalaCollectionCompat = "org.scala-lang.modules" %% "scala-collection-compat
 val caffeineLib = "com.github.ben-manes.caffeine" % "caffeine" % "2.9.3"
 val hdrHistogramLib = "org.hdrhistogram" % "HdrHistogram" % "2.1.11"
 val jsr305Lib = "com.google.code.findbugs" % "jsr305" % "2.0.1"
-val jsqlParserLib = "com.github.jsqlparser" % "jsqlparser" % "4.2"
+val jsqlParserLib = "com.github.jsqlparser" % "jsqlparser" % "4.6"
 val netty4StaticSsl = "io.netty" % "netty-tcnative-boringssl-static" % netty4StaticSslVersion
 val netty4Libs = Seq(
   "io.netty" % "netty-handler" % netty4Version,
   "io.netty" % "netty-transport" % netty4Version,
+  "io.netty" % "netty-resolver-dns" % netty4Version,
   "io.netty" % "netty-transport-native-epoll" % netty4Version classifier "linux-x86_64",
   "io.netty" % "netty-transport-native-epoll" % netty4Version classifier "linux-aarch_64",
   // this package is a dep of native-epoll above, explicitly add this for coursier plugin
@@ -58,6 +58,7 @@ val netty4Libs = Seq(
 val netty4LibsTest = Seq(
   "io.netty" % "netty-handler" % netty4Version % "test",
   "io.netty" % "netty-transport" % netty4Version % "test",
+  "io.netty" % "netty-resolver-dns" % netty4Version % "test",
   "io.netty" % "netty-transport-native-epoll" % netty4Version % "test" classifier "linux-x86_64",
   "io.netty" % "netty-transport-native-epoll" % netty4Version % "test" classifier "linux-aarch_64",
   // this package is a dep of native-epoll above, explicitly add this for coursier plugin
@@ -68,7 +69,7 @@ val netty4LibsTest = Seq(
 val netty4Http = "io.netty" % "netty-codec-http" % netty4Version
 val netty4Http2 = "io.netty" % "netty-codec-http2" % netty4Version
 val opencensusVersion = "0.24.0"
-val jacksonVersion = "2.13.2"
+val jacksonVersion = "2.14.2"
 val jacksonLibs = Seq(
   "com.fasterxml.jackson.core" % "jackson-core" % jacksonVersion,
   "com.fasterxml.jackson.core" % "jackson-databind" % jacksonVersion,
@@ -79,7 +80,7 @@ val thriftLibs = Seq(
 )
 val scroogeLibs = thriftLibs ++ Seq("com.twitter" %% "scrooge-core" % releaseVersion)
 
-val lz4Lib = "org.lz4" % "lz4-java" % "1.6.0"
+val lz4Lib = "org.lz4" % "lz4-java" % "1.8.0"
 
 def util(which: String) =
   "com.twitter" %% ("util-" + which) % releaseVersion excludeAll (ExclusionRule(organization =
@@ -153,7 +154,7 @@ val sharedSettings = Seq(
     "org.scalacheck" %% "scalacheck" % "1.15.4" % "test",
     "org.scalatest" %% "scalatest" % "3.1.1" % "test",
     "org.scalatestplus" %% "junit-4-12" % "3.1.2.0" % "test",
-    "org.scalatestplus" %% "mockito-1-10" % "3.1.0.0" % "test",
+    "org.scalatestplus" %% "mockito-3-3" % "3.1.2.0" % "test",
     "org.scalatestplus" %% "scalacheck-1-14" % "3.1.2.0" % "test",
     scalaCollectionCompat
   ),
@@ -166,7 +167,6 @@ val sharedSettings = Seq(
       case _ => sourceDir / "scala-2.12-"
     }
   },
-  ScoverageKeys.coverageHighlighting := true,
   Test / ScroogeSBT.autoImport.scroogeLanguages := Seq("java", "scala"),
   ivyXML :=
     <dependencies>
@@ -360,7 +360,8 @@ lazy val finagleIntegration = Project(
     finagleNetty4Http,
     finagleRedis % "test",
     finagleThrift,
-    finagleThriftMux % "test->compile;test->test"
+    finagleThriftMux % "test->compile;test->test",
+    finaglePostgresql % "test->compile;test->test"
   )
 
 lazy val finagleToggle = Project(
@@ -768,7 +769,9 @@ lazy val finagleExp = Project(
   ).settings(
     name := "finagle-exp",
     libraryDependencies ++= Seq(
-      "com.netflix.concurrency-limits" % "concurrency-limits-core" % "0.3.0"
+      "com.netflix.concurrency-limits" % "concurrency-limits-core" % "0.3.0",
+      "io.netty" % "netty-common" % netty4Version,
+      "commons-io" % "commons-io" % "2.11.0"
     )
   ).dependsOn(
     finagleCore % "compile->compile;test->test",
@@ -832,7 +835,7 @@ lazy val finagleBenchmarkThrift = Project(
   id = "finagle-benchmark-thrift",
   base = file("finagle-benchmark-thrift")
 ).settings(
-    sharedSettings
+    sharedSettings ++ Seq(Compile / scroogeLanguages := Seq("java", "scala"))
   ).settings(
     libraryDependencies ++= scroogeLibs
   ).dependsOn(finagleThrift)

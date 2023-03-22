@@ -3,7 +3,7 @@ package com.twitter.finagle.loadbalancer
 import com.twitter.finagle._
 import com.twitter.finagle.client.Transporter
 import com.twitter.finagle.loadbalancer.aperture.EagerConnections
-import com.twitter.finagle.loadbalancer.aperture.WeightedApertureToggle
+import com.twitter.finagle.loadbalancer.distributor.AddrLifecycle
 import com.twitter.finagle.service.FailFastFactory
 import com.twitter.finagle.stats._
 import com.twitter.finagle.util.DefaultLogger
@@ -13,9 +13,6 @@ import com.twitter.util.Event
 import com.twitter.util.Var
 import java.util.logging.Level
 import java.util.logging.Logger
-import com.twitter.finagle.loadbalancer.distributor.AddrLifecycle
-import com.twitter.finagle.naming.BindingFactory
-import com.twitter.finagle.util.Showable
 import scala.util.control.NonFatal
 
 /**
@@ -26,24 +23,6 @@ import scala.util.control.NonFatal
  */
 object LoadBalancerFactory {
   val role: Stack.Role = Stack.Role("LoadBalancer")
-
-  /** For now, some load balancers can support a mode where they can either manage
-   * their weights or not. In the future they'll only do what they advertise but
-   * we want to support both for now so we can toggle the behavior on. */
-  private[loadbalancer] case class ManageWeights(enabled: Boolean)
-
-  private[loadbalancer] object ManageWeights {
-    implicit val param = Stack.Param(ManageWeights(false))
-  }
-
-  /** A temporary stack param that allows you to override the [[WeightedApertureToggle]]
-   * for clients without modifying their flags directly.
-   */
-  private[twitter] case class UseWeightedBalancers(enabled: Boolean)
-
-  private[twitter] implicit object UseWeightedBalancers extends Stack.Param[UseWeightedBalancers] {
-    val default = UseWeightedBalancers(false)
-  }
 
   /**
    * A class eligible for configuring a client's load balancer probation setting.
@@ -158,18 +137,6 @@ object LoadBalancerFactory {
     implicit val param = new Stack.Param[Param] {
       def default: Param = Param(defaultBalancerFactory)
     }
-  }
-
-  /**
-   * A class eligible for configuring a [[com.twitter.finagle.Stackable]]
-   * [[com.twitter.finagle.loadbalancer.LoadBalancerFactory]] with whether endpoints
-   * should remain open and reusable. When enabled, endpoints will not be closed by the
-   * LoadBalancerFactory so implementations must ensure they close the endpoints
-   * themselves.
-   */
-  private[finagle] case class ReusableEndpoints(enabled: Boolean)
-  private[finagle] object ReusableEndpoints {
-    implicit val param: Stack.Param[ReusableEndpoints] = Stack.Param(ReusableEndpoints(false))
   }
 
   /**
@@ -349,8 +316,7 @@ object LoadBalancerFactory {
 
       def newBalancer(
         endpoints: Activity[Set[EndpointFactory[Req, Rep]]],
-        disableEagerConnections: Boolean,
-        manageWeights: Boolean
+        disableEagerConnections: Boolean
       ): ServiceFactory[Req, Rep] = {
         val ordering = params[AddressOrdering].ordering
         val orderedEndpoints = endpoints.map { set =>
@@ -367,14 +333,9 @@ object LoadBalancerFactory {
           }
         }
 
-        var finalParams = params + param.Stats(balancerStats) + ManageWeights(manageWeights)
+        var finalParams = params + param.Stats(balancerStats)
         if (disableEagerConnections) {
           finalParams = finalParams + EagerConnections(false)
-        }
-
-        if (!params.contains[PanicMode]) {
-          finalParams = finalParams + new PanicMode.ToggledPanicMode(
-            Showable.show(params[BindingFactory.Dest].dest)).asInstanceOf[PanicMode]
         }
 
         loadBalancerFactory.newBalancer(
@@ -398,17 +359,13 @@ object LoadBalancerFactory {
         )
       }
 
-      def shouldUseWeighted: Boolean =
-        if (params.contains[UseWeightedBalancers]) params[UseWeightedBalancers].enabled
-        else WeightedApertureToggle(label)
-
       // If weight-aware aperture load balancers are enabled, we do not wrap the
       // newBalancer in a TrafficDistributor.
-      if (loadBalancerFactory.supportsWeighted && shouldUseWeighted) {
+      if (loadBalancerFactory.supportsWeighted) {
         // Add the newBalancer to the stack
         Stack.leaf(
           role,
-          newBalancer(Activity(endpoints), disableEagerConnections = false, manageWeights = true)
+          newBalancer(Activity(endpoints), disableEagerConnections = false)
         )
       } else {
         // Instead of simply creating a newBalancer here, we defer to the
@@ -417,9 +374,8 @@ object LoadBalancerFactory {
           role,
           new TrafficDistributor[Req, Rep](
             dest = endpoints,
-            newBalancer = newBalancer(_, _, manageWeights = false),
-            statsReceiver = balancerStats,
-            reuseEndpoints = params[ReusableEndpoints].enabled
+            newBalancer = newBalancer(_, _),
+            statsReceiver = balancerStats
           )
         )
       }

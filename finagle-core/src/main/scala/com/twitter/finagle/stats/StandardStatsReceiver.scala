@@ -1,14 +1,12 @@
 package com.twitter.finagle.stats
 
-import com.twitter.finagle.stats.StandardStatsReceiver.{description, rootStatsReceiver, serverCount}
 import java.util.concurrent.atomic.AtomicInteger
 
-object StandardStatsReceiver {
+private object StandardStatsReceiver {
 
   // a shared counter among an application,
   // used to create incremental unique labels for servers with all protocols
-  // exposed for testing set up
-  private[finagle] val serverCount = new AtomicInteger(0)
+  private val serverCount = new AtomicInteger(0)
 
   private val standardPrefix = "standard-service-metric-v1"
   private val description = "Standard Service Metrics"
@@ -30,28 +28,42 @@ object StandardStatsReceiver {
  * @param sourceRole Represents the "role" this service plays with respect to this metric
  * @param protocol protocol library name, e.g., thriftmux, http
  */
-private[finagle] case class StandardStatsReceiver(
+private[finagle] class StandardStatsReceiver protected (
   sourceRole: SourceRole,
-  protocol: String)
+  protocol: String,
+  counter: AtomicInteger)
     extends StatsReceiverProxy {
 
-  require(sourceRole == Server, "StandardStatsReceiver should be apply to servers")
+  import StandardStatsReceiver._
 
-  private[this] val serverScope = sourceRole match {
-    case Server => sourceRole.toString.toLowerCase + s"-${serverCount.getAndIncrement()}"
-    case _ => "unsupported" // won't reach
+  def this(sourceRole: SourceRole, protocol: String) =
+    this(sourceRole, protocol, StandardStatsReceiver.serverCount)
+
+  private[this] def withDescription(metricBuilder: MetricBuilder): MetricBuilder = {
+    val existing = metricBuilder.description
+    val next =
+      if (existing == MetricBuilder.NoDescription) description
+      else s"$description: $existing"
+    metricBuilder.withDescription(next)
   }
 
-  val self: StatsReceiver =
+  private[this] val serverScope = sourceRole match {
+    case SourceRole.Server => s"${sourceRole.toString.toLowerCase}-${counter.getAndIncrement()}"
+    case other =>
+      throw new IllegalArgumentException(
+        s"StandardStatsReceiver should only be applied to servers, found $other.")
+  }
+
+  final val self: StatsReceiver =
     BroadcastStatsReceiver(
       Seq(rootStatsReceiver, rootStatsReceiver.scope(protocol).scope(serverScope)))
 
-  override def counter(metricBuilder: MetricBuilder): Counter =
-    self.counter(metricBuilder.withStandard.withUnlatchedCounter.withDescription(description))
+  final override def counter(metricBuilder: MetricBuilder): Counter =
+    self.counter(withDescription(metricBuilder).withStandard.withUnlatchedCounter)
 
-  override def stat(metricBuilder: MetricBuilder): Stat =
-    self.stat(metricBuilder.withStandard.withDescription(description))
+  final override def stat(metricBuilder: MetricBuilder): Stat =
+    self.stat(withDescription(metricBuilder).withStandard)
 
-  override def addGauge(metricBuilder: MetricBuilder)(f: => Float): Gauge =
-    self.addGauge(metricBuilder.withStandard.withDescription(description))(f)
+  final override def addGauge(metricBuilder: MetricBuilder)(f: => Float): Gauge =
+    self.addGauge(withDescription(metricBuilder).withStandard)(f)
 }

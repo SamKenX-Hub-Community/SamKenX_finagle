@@ -3,17 +3,24 @@ package com.twitter.finagle.service
 import com.twitter.conversions.DurationOps._
 import com.twitter.finagle._
 import com.twitter.finagle.context.Deadline
-import com.twitter.finagle.service.MetricBuilderRegistry.DeadlineRejectedCounter
 import com.twitter.finagle.stats.StatsReceiver
-import com.twitter.logging.{HasLogLevel, Level}
-import com.twitter.util.{Duration, Future, Stopwatch, Time, TokenBucket}
+import com.twitter.finagle.tracing.Trace
+import com.twitter.finagle.tracing.Tracing
+import com.twitter.logging.HasLogLevel
+import com.twitter.logging.Level
+import com.twitter.util.Duration
+import com.twitter.util.Future
+import com.twitter.util.Stopwatch
+import com.twitter.util.Time
+import com.twitter.util.TimeFormatter
+import com.twitter.util.TokenBucket
 
 /**
  * DeadlineFilter provides an admission control module that can be pushed onto the stack to
  * reject requests with expired deadlines (deadlines are set in the TimeoutFilter).
- * For servers, DeadlineFilter.module should be pushed onto the stack before the stats filters so
+ * For servers, DeadlineFilter.serverModule should be pushed onto the stack before the stats filters so
  * stats are recorded for the request, and pushed after TimeoutFilter where a new Deadline is set.
- * For clients, DeadlineFilter.module should be pushed before the stats filters; higher in the stack
+ * For clients, DeadlineFilter.clientModule should be pushed before the stats filters; higher in the stack
  * is preferable so requests are rejected as early as possible.
  *
  * @note Deadlines cross process boundaries and can span multiple nodes in a call graph.
@@ -22,6 +29,9 @@ import com.twitter.util.{Duration, Future, Stopwatch, Time, TokenBucket}
  *       well prepared to handle NACKs before using this.
  */
 object DeadlineFilter {
+
+  private[this] val millisecondFormat: TimeFormatter = TimeFormatter("yyyy-MM-dd HH:mm:ss:SSS Z")
+  private[service] def fmt(time: Time): String = millisecondFormat.format(time)
 
   private val DefaultRejectPeriod = 10.seconds
 
@@ -101,11 +111,15 @@ object DeadlineFilter {
     implicit val param: Stack.Param[Mode] = Stack.Param(Mode(Default))
   }
 
+  def clientModule[Req, Rep]: Stackable[ServiceFactory[Req, Rep]] = module("clnt/")
+
+  def serverModule[Req, Rep]: Stackable[ServiceFactory[Req, Rep]] = module("srv/")
+
   /**
    * Creates a [[com.twitter.finagle.Stackable]]
    * [[com.twitter.finagle.service.DeadlineFilter]].
    */
-  def module[Req, Rep]: Stackable[ServiceFactory[Req, Rep]] =
+  private[this] def module[Req, Rep](sourceRole: String): Stackable[ServiceFactory[Req, Rep]] =
     new Stack.Module5[
       param.Stats,
       param.MetricBuilders,
@@ -133,8 +147,10 @@ object DeadlineFilter {
             if (maxRejectFraction <= 0.0) next
             else {
               val param.Stats(statsReceiver) = _stats
-              val scopedStatsReceiver = statsReceiver.scope("admission_control", "deadline")
               val darkMode = mode == Mode(Mode.DarkMode)
+              val counterPrefix = if (darkMode) "darkmode_" else ""
+              val scopedStatsReceiver =
+                statsReceiver.scope("admission_control", counterPrefix + "deadline")
 
               new ServiceFactoryProxy[Req, Rep](next) {
 
@@ -146,6 +162,7 @@ object DeadlineFilter {
                       statsReceiver = scopedStatsReceiver,
                       metricsRegistry = _metrics.registry,
                       isDarkMode = darkMode,
+                      sourceRole = sourceRole
                     ).andThen(service)
 
                 override def apply(conn: ClientConnection): Future[Service[Req, Rep]] =
@@ -161,20 +178,27 @@ object DeadlineFilter {
     }
 
   class DeadlineExceededException private[DeadlineFilter] (
-    timestamp: Time,
-    deadline: Time,
-    elapsed: Duration,
-    now: Time,
+    msg: String,
     val flags: Long = FailureFlags.DeadlineExceeded)
-      extends Exception(
-        s"exceeded request deadline of ${deadline - timestamp} "
-          + s"by $elapsed. Deadline expired at $deadline and now it is $now."
-      )
+      extends Exception(msg)
       with FailureFlags[DeadlineExceededException]
       with HasLogLevel {
     def logLevel: Level = Level.DEBUG
     protected def copyWithFlags(flags: Long): DeadlineExceededException =
-      new DeadlineExceededException(timestamp, deadline, elapsed, now, flags)
+      new DeadlineExceededException(msg, flags)
+  }
+
+  private object DeadlineExceededException {
+    def apply(
+      deadline: Time,
+      elapsed: Duration,
+      now: Time,
+      flags: Long = FailureFlags.DeadlineExceeded
+    ): DeadlineExceededException = {
+      val msg = s"Exceeded request deadline by $elapsed. Deadline expired at ${fmt(
+        deadline)}. The time now is ${fmt(now)}."
+      new DeadlineExceededException(msg, flags)
+    }
   }
 }
 
@@ -192,8 +216,10 @@ object DeadlineFilter {
  *        ".../admission_control/deadline/"
  * @param nowMillis current time in milliseconds
  * @param isDarkMode DarkMode will collect stats but not reject requests
- * @param metricsRegistry an optional [MetricBuilderRegistry] set by stack parameter
+ * @param metricsRegistry an optional [CoreMetricsRegistry] set by stack parameter
  *        for injecting metrics and instrumenting top-line expressions
+ * @param sourceRole an optional param provides a prefix for deadline traces, typically "srv/" for
+ *        server side filters and "clnt/" for client side
  * @see The [[https://twitter.github.io/finagle/guide/Servers.html#request-deadline user guide]]
  *      for more details.
  */
@@ -202,8 +228,9 @@ class DeadlineFilter[Req, Rep](
   maxRejectFraction: Double = DeadlineFilter.DefaultMaxRejectFraction,
   statsReceiver: StatsReceiver,
   nowMillis: () => Long = Stopwatch.systemMillis,
-  metricsRegistry: Option[MetricBuilderRegistry] = None,
-  isDarkMode: Boolean)
+  metricsRegistry: Option[CoreMetricsRegistry] = None,
+  isDarkMode: Boolean,
+  sourceRole: String = "")
     extends SimpleFilter[Req, Rep] {
 
   def this(
@@ -213,8 +240,6 @@ class DeadlineFilter[Req, Rep](
     nowMillis: () => Long
   ) =
     this(rejectPeriod, maxRejectFraction, statsReceiver, nowMillis, None, false)
-
-  import DeadlineFilter.DeadlineExceededException
 
   require(
     rejectPeriod.inSeconds >= 1 && rejectPeriod.inSeconds <= 60,
@@ -228,9 +253,11 @@ class DeadlineFilter[Req, Rep](
   private[this] val rejectedCounter = statsReceiver.counter("rejected")
 
   // inject deadline rejection counter and instrument deadline rejection rate expression
-  metricsRegistry.map { registry =>
-    registry.setMetricBuilder(DeadlineRejectedCounter, rejectedCounter.metadata)
-    registry.deadlineRejection
+  for {
+    registry <- metricsRegistry
+    mb <- rejectedCounter.metadata.toMetricBuilder
+  } {
+    registry.setMetricBuilder(registry.DeadlineRejectedCounter, mb, statsReceiver)
   }
 
   private[this] val expiredTimeStat = statsReceiver.stat("expired_ms")
@@ -248,22 +275,29 @@ class DeadlineFilter[Req, Rep](
   // serviced and `serviceDeposit` tokens are added to `rejectBucket`.
   def apply(request: Req, service: Service[Req, Rep]): Future[Rep] = {
     Deadline.current match {
-      case Some(Deadline(timestamp, deadline)) =>
-        val now = Time.now
+      case Some(Deadline(_, deadline)) =>
+        val tracing = Trace()
 
-        if (deadline < now) {
-          val exceeded = now - deadline
+        val now = Time.now
+        val difference: Duration = deadline - now
+        val reject = rejectBucket.tryGet(rejectWithdrawal)
+
+        trace(tracing, deadline, difference, reject)
+
+        // If the difference is negative, we've exceeded the deadline
+        if (difference.inMillis < 0l) {
+          val exceeded = difference.abs
           exceededCounter.incr()
           expiredTimeStat.add(exceeded.inMillis)
 
           // There are enough tokens to reject the request
-          if (rejectBucket.tryGet(rejectWithdrawal)) {
+          if (reject) {
             rejectedCounter.incr()
             if (isDarkMode)
               service(request)
             else
               Future.exception(
-                new DeadlineExceededException(timestamp, deadline, exceeded, now)
+                DeadlineFilter.DeadlineExceededException(deadline, exceeded, now)
               )
           } else {
             rejectBucket.put(serviceDeposit)
@@ -271,13 +305,32 @@ class DeadlineFilter[Req, Rep](
           }
         } else {
           rejectBucket.put(serviceDeposit)
-          val remaining = deadline - now
+          val remaining = difference
           remainingTimeStat.add(remaining.inMillis)
           service(request)
         }
       case None =>
         rejectBucket.put(serviceDeposit)
         service(request)
+    }
+  }
+
+  // For all traces we ensure tracing of the deadline time. When the deadline is exceed, we trace
+  // how much extra time we've taken in ms and whether we've rejected the request. Otherwise,
+  // we record how much time we have left in ms.
+  private[this] def trace(
+    tracing: Tracing,
+    deadline: Time,
+    difference: Duration,
+    reject: Boolean
+  ): Unit = {
+    if (tracing.isActivelyTracing) {
+      tracing.recordBinary(s"${sourceRole}request_deadline", DeadlineFilter.fmt(deadline))
+      if (difference.inMillis < 0l) {
+        tracing.recordBinary(s"${sourceRole}request_deadline_exceeded_ms", difference.abs.inMillis)
+        if (reject) tracing.recordBinary(s"${sourceRole}request_deadline_rejected", true)
+      } else
+        tracing.recordBinary(s"${sourceRole}request_deadline_remaining_ms", difference.inMillis)
     }
   }
 }

@@ -11,7 +11,7 @@ import com.twitter.finagle.param.Stats
 import com.twitter.finagle.param.Timer
 import com.twitter.finagle.server.utils.StringServer
 import com.twitter.finagle.service.ExpiringService
-import com.twitter.finagle.service.MetricBuilderRegistry.ExpressionNames.deadlineRejectName
+import com.twitter.finagle.service.CoreMetricsRegistry.ExpressionNames.deadlineRejectName
 import com.twitter.finagle.service.TimeoutFilter
 import com.twitter.finagle.ssl.session.NullSslSessionInfo
 import com.twitter.finagle.ssl.session.SslSessionInfo
@@ -28,8 +28,11 @@ import org.scalatest.funsuite.AnyFunSuite
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.SocketAddress
+import com.twitter.finagle.util.TestParam
+import com.twitter.finagle.client.utils.StringClient
 
 class StackServerTest extends AnyFunSuite with Eventually {
+  def await[T](awaitable: Awaitable[T]): T = Await.result(awaitable, 5.seconds)
 
   test("withStack (Function1)") {
     val module = new Module0[ServiceFactory[String, String]] {
@@ -48,7 +51,7 @@ class StackServerTest extends AnyFunSuite with Eventually {
   }
 
   test("Deadline isn't changed until after it's recorded") {
-    val echo = ServiceFactory.const(Service.mk[Unit, Deadline] { unit =>
+    val echo = ServiceFactory.const(Service.mk[Unit, Deadline] { _ =>
       Future.value(Contexts.broadcast(Deadline))
     })
     val stack = StackServer.newStack[Unit, Deadline] ++ Stack.leaf(Endpoint, echo)
@@ -61,11 +64,11 @@ class StackServerTest extends AnyFunSuite with Eventually {
         ctl.advance(1.second)
         val result = svc(())
 
+        // The deadline inside the service's closure should be updated
+        assert(Await.result(result) == Deadline.ofTimeout(1.second))
+
         // we should be one second ahead
         assert(statsReceiver.stats(Seq("transit_latency_ms"))(0) == 1.second.inMilliseconds.toFloat)
-
-        // but the deadline inside the service's closure should be updated
-        assert(Await.result(result) == Deadline.ofTimeout(1.second))
       }
     }
   }
@@ -79,6 +82,7 @@ class StackServerTest extends AnyFunSuite with Eventually {
         Future.value(svc)
       }
       def close(deadline: Time) = Future.Done
+      def status: Status = Status.Open
     }
     val stack = StackServer.newStack[Int, Int] ++ Stack.leaf(Endpoint, connSF)
     val sr = new InMemoryStatsReceiver
@@ -187,7 +191,7 @@ class StackServerTest extends AnyFunSuite with Eventually {
   }
 
   test("Items appended to DefaultTransformer appear in the listing") {
-    val transformer = new StackTransformer {
+    val transformer = new ServerStackTransformer {
       val name = "id"
       def apply[A, B](s: Stack[ServiceFactory[A, B]]) = s
     }
@@ -228,7 +232,7 @@ class StackServerTest extends AnyFunSuite with Eventually {
       }
 
     StackServer.DefaultTransformer.append(
-      new StackTransformer {
+      new ServerStackTransformer {
         val name = "test"
         def apply[A, B](stack: Stack[ServiceFactory[A, B]]) =
           stack
@@ -253,6 +257,41 @@ class StackServerTest extends AnyFunSuite with Eventually {
     assert(didRun)
 
     Await.ready(server.close(), 10.seconds)
+  }
+
+  test("Injects the appropriate params") {
+    var testParamValue = 0
+
+    val verifyModule = new Stack.Module1[TestParam, ServiceFactory[String, String]] {
+      val role = Stack.Role("verify")
+      val description = "Verifies the value of the test param"
+
+      def make(
+        testParam: TestParam,
+        next: ServiceFactory[String, String]
+      ): ServiceFactory[String, String] = {
+        testParamValue = testParam.p1
+        new SimpleFilter[String, String] {
+          def apply(request: String, service: Service[String, String]): Future[String] = {
+            Future.value("world")
+          }
+        }.andThen(next)
+      }
+    }
+    // push the verification module onto the stack.  doesn't really matter where in the stack it
+    // goes
+    val listeningServer = StringServer.server
+      .withStack(verifyModule +: _)
+      .serve(":*", Service.mk[String, String](Future.value))
+    val boundAddress = listeningServer.boundAddress.asInstanceOf[InetSocketAddress]
+    val label = "stringClient"
+
+    val svc = StringClient.client
+      .newService(Name.bound(Address(boundAddress)), label)
+
+    await(svc("hello"))
+
+    assert(testParamValue == 38)
   }
 
   private[this] def nameToKey(

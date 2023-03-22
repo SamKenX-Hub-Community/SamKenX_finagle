@@ -2,7 +2,6 @@ package com.twitter.finagle.loadbalancer
 
 import com.twitter.finagle._
 import com.twitter.finagle.benchmark.StdBenchAnnotations
-import com.twitter.finagle.loadbalancer.PanicMode
 import com.twitter.finagle.stats.Counter
 import com.twitter.finagle.stats.NullStatsReceiver
 import com.twitter.finagle.stats.StatsReceiver
@@ -28,6 +27,8 @@ object BalancerBench {
           def apply(req: Unit): Future[Unit] = Future.Done
         })
       def close(when: Time): Future[Unit] = Future.Done
+
+      def status: Status = Status.Open
     }
 
   def newActivity(num: Int): Activity[Vector[EndpointFactory[Unit, Unit]]] = {
@@ -40,7 +41,6 @@ object BalancerBench {
       with NodeT[Unit, Unit] {
 
     def load: Double = 0.0
-    def pending: Int = 0
     override def close(deadline: Time): Future[Unit] = Future.Done
   }
 
